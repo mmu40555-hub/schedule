@@ -1,0 +1,12 @@
+# Python 缓存
+__pycache__/
+*.py[cod]
+
+# 打包工具与打包产物：工具是第三方下载件，exe 每次都能重新生成
+_build_tools/
+_build_work/
+_build.log
+*.exe
+
+# 运行数据：里面是本机自己的日程，不入库
+schedule.db
