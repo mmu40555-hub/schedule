@@ -12,6 +12,7 @@ import sys
 from PyQt6.QtCore import QEvent, QRectF, Qt
 from PyQt6.QtGui import (
     QColor,
+    QCursor,
     QFont,
     QIcon,
     QPainter,
@@ -32,7 +33,9 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from hotkey import GlobalHotkey
 from memo import MemoPage
+from sound import ensure_sound_dir
 from storage import NAV_LEFT, Store
 from theme import APP_QSS, FONT_FAMILY
 from today_view import TodayView
@@ -114,6 +117,13 @@ class MainWindow(QMainWindow):
         self._build_layout()
         self._refresh_nav()
 
+        # 全局快捷键：程序不在前台时，按下也能在鼠标处开一张桌面便签
+        self.hotkey = GlobalHotkey(self, self)
+        self.hotkey.activated.connect(
+            self._on_hotkey, Qt.ConnectionType.QueuedConnection
+        )
+        self.apply_hotkey()
+
     # ---------- 页面导航 ----------
 
     def _build_layout(self) -> None:
@@ -178,6 +188,7 @@ class MainWindow(QMainWindow):
             button.style().polish(button)
 
     def _on_settings_saved(self) -> None:
+        self.apply_hotkey()
         if self.store.nav_position() == self._nav_position:
             return
         # 先把页面栈摘出来，免得随旧骨架一起被回收
@@ -185,10 +196,34 @@ class MainWindow(QMainWindow):
         self._build_layout()
         self._refresh_nav()
 
+    # ---------- 全局快捷键 ----------
+
+    def apply_hotkey(self) -> None:
+        """按设置里的组合键重新注册；注册不上就通过托盘说一声。"""
+        shortcut = self.store.new_note_hotkey()
+        if not shortcut:
+            self.hotkey.unregister()
+            return
+        if self.hotkey.register(shortcut):
+            return
+        if self.tray is not None:
+            self.tray.showMessage(
+                "便签快捷键没能启用",
+                f"{shortcut} 可能已被别的程序占用，到设置里换一个组合试试。",
+                QSystemTrayIcon.MessageIcon.Warning,
+                4000,
+            )
+
+    def _on_hotkey(self) -> None:
+        """快捷键对应的动作：在鼠标位置直接摊一张桌面便签。"""
+        self.memo_view.create_desk_note(QCursor.pos())
+
     # ---------- 托盘与退出 ----------
 
     def attach_tray(self, tray: "TrayIcon") -> None:
         self.tray = tray
+        # 这会儿才有托盘可以报信，补注册一次
+        self.apply_hotkey()
 
     def changeEvent(self, event):
         """最小化 / 还原时，钉在桌面上的便签跟着一起收起、露面。"""
@@ -309,6 +344,9 @@ def main() -> None:
     # 已经有窗口在跑就不再开第二个
     if _wake_existing_instance():
         return
+
+    # 提醒音自定义用的「铃声」文件夹：启动时就摆出来，用户可以直接把音乐丢进去
+    ensure_sound_dir()
 
     store = Store()
     window = MainWindow(store)

@@ -236,6 +236,7 @@ class TodayView(QWidget):
             self.store.remind_sound_choice(),
             self.store.remind_sound_files(),
             self.store.nav_position(),
+            self.store.new_note_hotkey(),
             self,
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
@@ -247,6 +248,7 @@ class TodayView(QWidget):
         self.store.set_remind_sound_choice(values["sound_choice"])
         self.store.set_remind_sound_files(values["sound_files"])
         self.store.set_setting(SETTING_NAV_POSITION, str(values["nav_position"]))
+        self.store.set_new_note_hotkey(values["new_note_hotkey"])
         self.settings_saved.emit()
 
     def _default_remind(self) -> int:
@@ -625,6 +627,7 @@ class TodayView(QWidget):
         column.step_back_requested.connect(self._on_step_back)
         column.menu_requested.connect(self._on_menu)
         column.group_menu_requested.connect(self._on_group_menu)
+        column.backlog_purge_requested.connect(self._on_backlog_purge)
 
     # ---------- 数据 ----------
 
@@ -712,6 +715,25 @@ class TodayView(QWidget):
 
     def _on_dismiss(self, item_key: str) -> None:
         self.store.dismiss_item(item_key)
+        self.reload()
+
+    def _on_backlog_purge(self, title: str) -> None:
+        """陈年旧账里同名的一批积压项，一起消去。"""
+        keys = [
+            item.key for item in self.data.get(COL_BACKLOG, [])
+            if item.title == title
+        ]
+        if not keys:
+            return
+        if not self._confirm(
+            "统一消去旧账",
+            f"确定把「{title}」的 {len(keys)} 条积压任务一起消去吗？\n"
+            "消去后这些日子不再出现在「陈年旧账」里，任务本身与完成记录不受影响。",
+            "统一消去",
+        ):
+            return
+        for key in keys:
+            self.store.dismiss_item(key)
         self.reload()
 
     def _on_reorder(self, column_id: str, item_key: str, index: int) -> None:

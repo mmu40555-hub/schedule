@@ -44,6 +44,28 @@ BACKLOG_SOURCE_ORDER = {
     SOURCE_DAILY: 2,
 }
 
+# ---------------- 每日任务的重复周期 ----------------
+
+REPEAT_DAILY = "daily"      # 每天
+REPEAT_WEEKLY = "weekly"    # 每周固定一个星期几
+REPEAT_MONTHLY = "monthly"  # 每月固定一个日期
+
+REPEAT_CHOICES = [
+    (REPEAT_DAILY, "每天"),
+    (REPEAT_WEEKLY, "每周"),
+    (REPEAT_MONTHLY, "每月"),
+]
+
+# 每周任务的星期名，下标与 date.weekday() 对齐（0 = 周一）
+WEEKDAY_NAMES = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+
+# 卡片上显示的来源标签：每日任务再按周期细分
+REPEAT_LABEL = {
+    REPEAT_DAILY: "每日",
+    REPEAT_WEEKLY: "每周",
+    REPEAT_MONTHLY: "每月",
+}
+
 # 没有归属分组的任务，在首页归到这一组里显示
 UNGROUPED_LABEL = "未归组"
 
@@ -78,6 +100,8 @@ class TodayItem:
     foot: str = ""                  # 卡片底部小字
     done: bool = False
     step_back: bool = False         # 时期任务已完成过阶段时，卡片上给出「返回上一阶段」
+    repeat: str = REPEAT_DAILY      # 每日任务的重复周期：每天 / 每周 / 每月
+    streak_unit: str = "天"         # 连续计数的单位：每天算「天」，每周每月算「次」
 
     @property
     def time_display(self) -> str:
@@ -86,8 +110,18 @@ class TodayItem:
         return self.time_text
 
     @property
+    def source_label(self) -> str:
+        """卡片上的来源标签：每日任务按周期显示每日 / 每周 / 每月。"""
+        if self.source == SOURCE_DAILY:
+            return REPEAT_LABEL.get(self.repeat, "每日")
+        return SOURCE_LABEL[self.source]
+
+    @property
     def streak_text(self) -> str:
         """只有今天的每日任务卡片展示连续次数，积压项不展示。"""
         if self.source != SOURCE_DAILY or self.column == COL_BACKLOG:
             return ""
-        return f"连续 {self.streak} 天 · 最长 {self.best_streak} 天"
+        return (
+            f"连续 {self.streak} {self.streak_unit}"
+            f" · 最长 {self.best_streak} {self.streak_unit}"
+        )

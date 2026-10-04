@@ -15,7 +15,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from models import COLUMN_SUBTITLE, COLUMN_TITLE, UNGROUPED_LABEL, TodayItem
+from models import COL_BACKLOG, COLUMN_SUBTITLE, COLUMN_TITLE, UNGROUPED_LABEL, TodayItem
 from task_card import MIME_TYPE, TaskCard
 from theme import ACCENT
 
@@ -63,12 +63,49 @@ class GroupHeader(QFrame):
             row.addWidget(more)
 
 
+class BacklogHeader(QFrame):
+    """陈年旧账里的一批同名任务：折叠箭头 + 任务名 + 条数 + 「统一消去」。"""
+
+    toggled = pyqtSignal(str)
+    purge_requested = pyqtSignal(str)
+
+    def __init__(self, title: str, count: int, collapsed: bool, parent=None):
+        super().__init__(parent)
+        self.setObjectName("GroupHeader")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 6, 0, 0)
+        row.setSpacing(6)
+
+        arrow = "▸" if collapsed else "▾"
+        self.toggle = QPushButton(f"{arrow} {title}")
+        self.toggle.setObjectName("GroupToggle")
+        self.toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.toggle.setToolTip("点击折叠 / 展开这一批同名旧账")
+        self.toggle.clicked.connect(lambda: self.toggled.emit(title))
+        row.addWidget(self.toggle)
+
+        count_label = QLabel(str(count))
+        count_label.setObjectName("ColumnSub")
+        row.addWidget(count_label)
+        row.addStretch(1)
+
+        purge = QPushButton("统一消去")
+        purge.setObjectName("GhostButton")
+        purge.setCursor(Qt.CursorShape.PointingHandCursor)
+        purge.setToolTip("把这一批同名旧账一起消去，之后不再保留")
+        purge.clicked.connect(lambda: self.purge_requested.emit(title))
+        row.addWidget(purge)
+
+
 class _DropHost(QWidget):
     """卡片容器。只接受同栏卡片的拖拽，跨栏一律拒绝。"""
 
     dropped = pyqtSignal(str, str, int)  # column_id, task_id, 目标索引
     group_toggled = pyqtSignal(str)
     group_menu_requested = pyqtSignal(str, object)
+    backlog_purge_requested = pyqtSignal(str)
 
     def __init__(self, column_id: str, parent=None):
         super().__init__(parent)
@@ -103,6 +140,14 @@ class _DropHost(QWidget):
                 header = GroupHeader(name, count, collapsed)
                 header.toggled.connect(self.group_toggled)
                 header.menu_requested.connect(self.group_menu_requested)
+                self.box.addWidget(header)
+                continue
+
+            if row[0] == "purge_group":
+                _, title, count, collapsed = row
+                header = BacklogHeader(title, count, collapsed)
+                header.toggled.connect(self.group_toggled)
+                header.purge_requested.connect(self.backlog_purge_requested)
                 self.box.addWidget(header)
                 continue
 
@@ -200,6 +245,7 @@ class TaskColumn(QFrame):
     step_back_requested = pyqtSignal(str)
     menu_requested = pyqtSignal(str, object)
     group_menu_requested = pyqtSignal(str, object)
+    backlog_purge_requested = pyqtSignal(str)
 
     def __init__(self, column_id: str, parent=None):
         super().__init__(parent)
@@ -250,6 +296,7 @@ class TaskColumn(QFrame):
         self.host.dropped.connect(self.order_changed)
         self.host.group_toggled.connect(self._on_group_toggled)
         self.host.group_menu_requested.connect(self.group_menu_requested)
+        self.host.backlog_purge_requested.connect(self.backlog_purge_requested)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -263,7 +310,9 @@ class TaskColumn(QFrame):
     def set_tasks(self, tasks: list[TodayItem]) -> None:
         self.tasks = tasks
 
-        # 同组的任务排在一起，组别之间按首次出现的顺序排列，空组名归入「未归组」
+        # 陈年旧账只按任务名折叠：同名积压项收进一组，组头可「统一消去」；
+        # 其余栏按归属分组折叠，组别之间按首次出现的顺序排列。
+        group_by_title = self.column_id == COL_BACKLOG
         sections: dict[str, list[tuple[int, TaskCard]]] = {}
         for index, item in enumerate(tasks):
             card = TaskCard(item)
@@ -271,12 +320,14 @@ class TaskColumn(QFrame):
             card.dismiss_requested.connect(self.dismiss_requested)
             card.step_back_requested.connect(self.step_back_requested)
             card.menu_requested.connect(self.menu_requested)
-            sections.setdefault(item.group, []).append((index, card))
+            key = item.title if group_by_title else item.group
+            sections.setdefault(key, []).append((index, card))
 
         rows: list[tuple] = []
-        for group, entries in sections.items():
-            collapsed = group in self.collapsed
-            rows.append(("group", group, len(entries), collapsed))
+        header_kind = "purge_group" if group_by_title else "group"
+        for key, entries in sections.items():
+            collapsed = key in self.collapsed
+            rows.append((header_kind, key, len(entries), collapsed))
             rows.extend(("card", card, index, collapsed) for index, card in entries)
 
         self.host.set_rows(rows, len(tasks))

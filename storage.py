@@ -4,6 +4,7 @@
 首页的「今日一览」不落库，而是每次根据定义 + 当天日期实时推导。
 """
 
+import calendar
 import sqlite3
 import sys
 from dataclasses import dataclass
@@ -15,6 +16,9 @@ from models import (
     COL_BACKLOG,
     COL_UNSCHEDULED,
     COL_URGENT,
+    REPEAT_DAILY,
+    REPEAT_MONTHLY,
+    REPEAT_WEEKLY,
     SOURCE_DAILY,
     SOURCE_ONCE,
     SOURCE_PERIOD,
@@ -33,6 +37,13 @@ DB_PATH = _app_dir() / "schedule.db"
 
 # 历史未完成记录最多回溯多少天（避免积压栏被陈年数据淹没）
 BACKLOG_LOOKBACK_DAYS = 7
+
+# 陈年旧账的回溯天数：每周/每月任务的漏勾日子间隔更远，得多看一阵子
+BACKLOG_LOOKBACK = {
+    REPEAT_DAILY: BACKLOG_LOOKBACK_DAYS,
+    REPEAT_WEEKLY: 14,
+    REPEAT_MONTHLY: 62,
+}
 
 # 没勾「每天显示」的临时任务，只在到期前这几天开始出现在首页
 ONCE_LEAD_DAYS = 3
@@ -74,6 +85,10 @@ NAV_POSITIONS = [
 # 一摞便签最多叠几张
 MAX_MEMO_STACK = 5
 
+# 全局快捷键：在任何程序里按下就能在鼠标处新建一张桌面便签
+SETTING_NEW_NOTE_HOTKEY = "new_note_hotkey"
+DEFAULT_NEW_NOTE_HOTKEY = "Ctrl+Alt+N"
+
 REMIND_AUTO = "auto"     # 有悬浮窗就在悬浮窗内提示，否则弹置底小窗
 REMIND_POPUP = "popup"   # 只用置底小窗
 REMIND_BOTH = "both"     # 两处都提示
@@ -94,6 +109,8 @@ CREATE TABLE IF NOT EXISTS daily_tasks (
     remind_minutes INTEGER NOT NULL DEFAULT 10,
     note          TEXT    NOT NULL DEFAULT '',
     backlog       INTEGER NOT NULL DEFAULT 1,
+    repeat        TEXT    NOT NULL DEFAULT 'daily',
+    repeat_day    INTEGER NOT NULL DEFAULT 0,
     created_day   TEXT    NOT NULL DEFAULT '',
     sort_order    INTEGER NOT NULL DEFAULT 0
 );
@@ -176,6 +193,10 @@ CREATE TABLE IF NOT EXISTS memos (
     stack_order INTEGER NOT NULL DEFAULT 0,
     stack_active INTEGER NOT NULL DEFAULT 1,
     pinned      INTEGER NOT NULL DEFAULT 0,
+    host_class  TEXT    NOT NULL DEFAULT '',
+    host_title  TEXT    NOT NULL DEFAULT '',
+    host_dx     INTEGER NOT NULL DEFAULT 0,
+    host_dy     INTEGER NOT NULL DEFAULT 0,
     updated_day TEXT    NOT NULL DEFAULT ''
 );
 """
@@ -195,6 +216,8 @@ class DailyTask:
     created_day: str = ""
     sort_order: int = 0
     remind_minutes: int = DEFAULT_REMIND_MINUTES   # 截止前几分钟提醒
+    repeat: str = REPEAT_DAILY    # 重复周期：每天 / 每周 / 每月
+    repeat_day: int = 0           # 每周→星期几(0~6)，每月→几号(1~31)，每天忽略
 
 
 @dataclass
@@ -262,6 +285,12 @@ class Memo:
     stack_order: int = 0    # 摞内编号，页签序号就按它排，进摞后不再变动
     stack_active: int = 1   # 1 表示这一摞当前露在外面的就是这张
     pinned: int = 0         # 1 表示钉在桌面上（独立小窗），0 表示躺在备忘录页面里
+    # 钉在某个程序窗口上时，记下那个窗口是谁：类名 + 标题用于下次开程序时把它找回来，
+    # dx / dy 是便签左上角相对该窗口左上角的距离，窗口一动就照这个把它带过去
+    host_class: str = ""
+    host_title: str = ""
+    host_dx: int = 0
+    host_dy: int = 0
     updated_day: str = ""
 
 
@@ -275,6 +304,10 @@ def _memo(row: sqlite3.Row) -> Memo:
         stack_order=row["stack_order"],
         stack_active=row["stack_active"],
         pinned=row["pinned"],
+        host_class=row["host_class"],
+        host_title=row["host_title"],
+        host_dx=row["host_dx"],
+        host_dy=row["host_dy"],
         updated_day=row["updated_day"],
     )
 
@@ -291,6 +324,8 @@ def _daily(row: sqlite3.Row) -> DailyTask:
         created_day=row["created_day"],
         sort_order=row["sort_order"],
         remind_minutes=row["remind_minutes"],
+        repeat=row["repeat"],
+        repeat_day=row["repeat_day"],
     )
 
 
@@ -359,6 +394,13 @@ class Store:
         )
         self._add_column("memos", "stack_active", "INTEGER NOT NULL DEFAULT 1")
         self._add_column("memos", "pinned", "INTEGER NOT NULL DEFAULT 0")
+        self._add_column("memos", "host_class", "TEXT NOT NULL DEFAULT ''")
+        self._add_column("memos", "host_title", "TEXT NOT NULL DEFAULT ''")
+        self._add_column("memos", "host_dx", "INTEGER NOT NULL DEFAULT 0")
+        self._add_column("memos", "host_dy", "INTEGER NOT NULL DEFAULT 0")
+        # 每日任务后来支持了每周 / 每月周期
+        self._add_column("daily_tasks", "repeat", "TEXT NOT NULL DEFAULT 'daily'")
+        self._add_column("daily_tasks", "repeat_day", "INTEGER NOT NULL DEFAULT 0")
 
         # 组别早期只服务于每日任务，表名 daily_groups，现在三类任务共用
         tables = {
@@ -471,15 +513,16 @@ class Store:
     def create_daily_task(self, title: str, group_name: str = "", has_deadline: bool = False,
                           deadline_time: str = "", note: str = "",
                           created_day: str | None = None, backlog: bool = True,
-                          remind_minutes: int = DEFAULT_REMIND_MINUTES) -> int:
+                          remind_minutes: int = DEFAULT_REMIND_MINUTES,
+                          repeat: str = REPEAT_DAILY, repeat_day: int = 0) -> int:
         order = self._next_order("daily_tasks")
         cursor = self.conn.execute(
             "INSERT INTO daily_tasks (title, group_name, has_deadline, deadline_time,"
-            " remind_minutes, note, created_day, backlog, sort_order)"
-            " VALUES (?,?,?,?,?,?,?,?,?)",
+            " remind_minutes, note, created_day, backlog, repeat, repeat_day, sort_order)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (title, group_name, int(has_deadline), deadline_time,
              int(remind_minutes), note, created_day or date.today().isoformat(),
-             int(backlog), order),
+             int(backlog), _clean_repeat(repeat), int(repeat_day), order),
         )
         self._ensure_group(group_name)
         self.conn.commit()
@@ -488,12 +531,13 @@ class Store:
     def update_daily_task(self, task_id: int, title: str, group_name: str = "",
                           has_deadline: bool = False, deadline_time: str = "",
                           note: str = "", backlog: bool = True,
-                          remind_minutes: int = DEFAULT_REMIND_MINUTES) -> None:
+                          remind_minutes: int = DEFAULT_REMIND_MINUTES,
+                          repeat: str = REPEAT_DAILY, repeat_day: int = 0) -> None:
         self.conn.execute(
             "UPDATE daily_tasks SET title=?, group_name=?, has_deadline=?, deadline_time=?,"
-            " remind_minutes=?, note=?, backlog=? WHERE id=?",
+            " remind_minutes=?, note=?, backlog=?, repeat=?, repeat_day=? WHERE id=?",
             (title, group_name, int(has_deadline), deadline_time, int(remind_minutes),
-             note, int(backlog), task_id),
+             note, int(backlog), _clean_repeat(repeat), int(repeat_day), task_id),
         )
         self._ensure_group(group_name)
         self.conn.commit()
@@ -633,6 +677,12 @@ class Store:
 
     def _collect_daily(self, items: dict[str, list[TodayItem]], today: date) -> None:
         for task in self.list_daily_tasks():
+            # 今天不是它的日子（每周 / 每月任务）：今日栏不露面，
+            # 但漏掉的过往日子照旧进「陈年旧账」，可以补勾
+            if not self._occurs_on(task, today):
+                items[COL_BACKLOG].extend(self._daily_backlog(task, today))
+                continue
+
             record = self._ensure_daily_record(task, today)
             streak, best_streak = self._daily_streaks(task, today)
 
@@ -647,14 +697,37 @@ class Store:
                 best_streak=best_streak,
                 note=task.note,
                 done=bool(record["done"]),
+                repeat=task.repeat,
+                streak_unit="天" if task.repeat == REPEAT_DAILY else "次",
             )
             items[item.column].append(item)
 
             # 漏勾的日子进积压栏，可在那里补勾（补勾即算那天有效）或移除
             items[COL_BACKLOG].extend(self._daily_backlog(task, today))
 
+    def _occurs_on(self, task: DailyTask, day: date) -> bool:
+        """这个任务在指定那天该不该出现（每天任务恒为真）。"""
+        if task.repeat == REPEAT_WEEKLY:
+            return day.weekday() == int(task.repeat_day) % 7
+        if task.repeat == REPEAT_MONTHLY:
+            return day.day == _month_day(day, int(task.repeat_day))
+        return True
+
+    def _occurrences(self, task: DailyTask, start: date, end: date) -> list[date]:
+        """[start, end] 之间任务应当出现的日子，用来算连续次数。"""
+        days: list[date] = []
+        day = start
+        while day <= end:
+            if self._occurs_on(task, day):
+                days.append(day)
+            day += timedelta(days=1)
+        return days
+
     def _daily_streaks(self, task: DailyTask, today: date) -> tuple[int, int]:
-        """返回 (最新连续完成次数, 历史最高连续完成次数)，单位是天。"""
+        """返回 (最新连续完成次数, 历史最高连续完成次数)。
+
+        每天任务按「天」算；每周/每月任务只看它该出现的那几天，按「次」算。
+        """
         done_days = {
             row["day"]
             for row in self.conn.execute(
@@ -667,31 +740,31 @@ class Store:
 
         first = date.fromisoformat(task.created_day) if task.created_day else today
         start = min(first, date.fromisoformat(min(done_days)))
+        occurrences = self._occurrences(task, start, today)
 
         best = run = 0
-        day = start
-        while day <= today:
+        for day in occurrences:
             if day.isoformat() in done_days:
                 run += 1
                 best = max(best, run)
-            else:
+            elif day != today:
+                # 今天还没勾不算中断，补勾后自然接上
                 run = 0
-            day += timedelta(days=1)
 
-        # 今天还没勾不算中断，从昨天往回数；补勾后自然接上
-        cursor = today if today.isoformat() in done_days else today - timedelta(days=1)
         streak = 0
-        while cursor >= start and cursor.isoformat() in done_days:
-            streak += 1
-            cursor -= timedelta(days=1)
+        for day in reversed(occurrences):
+            if day.isoformat() in done_days:
+                streak += 1
+            elif day != today:
+                break
         return streak, best
 
     def _daily_backlog(self, task: DailyTask, today: date) -> list[TodayItem]:
-        """任务已存在、但那一天没完成的日子，逐天列出以便日后补勾。"""
+        """任务已存在、但该出现的那天没完成的日子，逐天列出以便日后补勾。"""
         if not task.backlog:
             return []
 
-        start = today - timedelta(days=BACKLOG_LOOKBACK_DAYS)
+        start = today - timedelta(days=BACKLOG_LOOKBACK.get(task.repeat, BACKLOG_LOOKBACK_DAYS))
         if task.created_day:
             start = max(start, date.fromisoformat(task.created_day))
 
@@ -708,7 +781,8 @@ class Store:
         day = start
         while day < today:
             day_str = day.isoformat()
-            if not done_map.get(day_str):
+            # 每周/每月任务只列它该出现的那几天
+            if self._occurs_on(task, day) and not done_map.get(day_str):
                 key = f"{SOURCE_DAILY}:{task.id}@{day_str}"
                 if not self._is_dismissed(key):
                     result.append(
@@ -721,6 +795,7 @@ class Store:
                             note=task.note,
                             foot=f"{_pretty_day(day_str)} 未完成",
                             done=False,
+                            repeat=task.repeat,
                         )
                     )
             day += timedelta(days=1)
@@ -937,6 +1012,24 @@ class Store:
         )
         self.conn.commit()
 
+    def save_memo_host(
+        self,
+        memo_id: int,
+        host_class: str = "",
+        host_title: str = "",
+        dx: int = 0,
+        dy: int = 0,
+    ) -> None:
+        """记住这张便签贴在哪个窗口上、贴在窗口的哪个位置。
+
+        什么都不传就是忘掉这个宿主（便签重新变回一块普通浮窗）。
+        """
+        self.conn.execute(
+            "UPDATE memos SET host_class=?, host_title=?, host_dx=?, host_dy=? WHERE id=?",
+            (host_class, host_title, int(dx), int(dy), int(memo_id)),
+        )
+        self.conn.commit()
+
     def delete_memo(self, memo_id: int) -> None:
         """删掉一张便签；摞里只剩一张时自动散掉。"""
         row = self.conn.execute(
@@ -1123,6 +1216,13 @@ class Store:
         """主导航在顶部还是左侧。"""
         position = self.get_setting(SETTING_NAV_POSITION, NAV_TOP)
         return position if position in {value for value, _ in NAV_POSITIONS} else NAV_TOP
+
+    def new_note_hotkey(self) -> str:
+        """新建便签的全局快捷键；空串表示用户把它关掉了。"""
+        return self.get_setting(SETTING_NEW_NOTE_HOTKEY, DEFAULT_NEW_NOTE_HOTKEY).strip()
+
+    def set_new_note_hotkey(self, shortcut: str) -> None:
+        self.set_setting(SETTING_NEW_NOTE_HOTKEY, str(shortcut).strip())
 
     # ================= 到点提醒 =================
 
@@ -1360,6 +1460,19 @@ class Store:
             (task_id, day.isoformat(), int(done)),
         )
         self.conn.commit()
+
+
+def _clean_repeat(repeat: str) -> str:
+    """校验重复周期，非法的落回「每天」。"""
+    if repeat in (REPEAT_DAILY, REPEAT_WEEKLY, REPEAT_MONTHLY):
+        return repeat
+    return REPEAT_DAILY
+
+
+def _month_day(day: date, repeat_day: int) -> int:
+    """每月任务的「几号」：超过当月天数就落到当月最后一天（如 2 月记 31 号时算 28/29 号）。"""
+    last = calendar.monthrange(day.year, day.month)[1]
+    return min(max(1, int(repeat_day)), last)
 
 
 def _pretty_day(day_str: str) -> str:

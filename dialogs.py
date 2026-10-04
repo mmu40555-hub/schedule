@@ -1,5 +1,7 @@
 """三个任务编辑对话框：长期每日任务 / 某日临时任务 / 时期任务。"""
 
+import os
+
 from PyQt6.QtCore import QDate, QTime, Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QAbstractSpinBox,
@@ -21,16 +23,27 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from models import (
+    REPEAT_CHOICES,
+    REPEAT_DAILY,
+    REPEAT_MONTHLY,
+    REPEAT_WEEKLY,
+    WEEKDAY_NAMES,
+)
 from sound import (
     AUDIO_FILTER,
     DEFAULT_CHOICE,
     SYSTEM_SOUNDS,
     alias_choice,
     choice_label,
+    ensure_sound_dir,
     file_choice,
+    list_sound_files,
     play_remind_sound,
 )
+from hotkey import parse
 from storage import (
+    DEFAULT_NEW_NOTE_HOTKEY,
     DEFAULT_REMIND_MINUTES,
     NAV_POSITIONS,
     NAV_TOP,
@@ -41,6 +54,74 @@ from storage import (
 )
 
 DATE_FORMAT = "yyyy-MM-dd"
+
+# Qt 的按键 → 快捷键文本里的主键名：字母、数字、功能键，外加几个常用键
+_KEY_NAMES: dict[int, str] = {}
+for _code in range(ord("A"), ord("Z") + 1):
+    _KEY_NAMES[_code] = chr(_code)
+for _code in range(ord("0"), ord("9") + 1):
+    _KEY_NAMES[_code] = chr(_code)
+for _n in range(1, 25):
+    _KEY_NAMES[Qt.Key.Key_F1.value + _n - 1] = f"F{_n}"
+_KEY_NAMES.update({
+    Qt.Key.Key_Space.value: "Space",
+    Qt.Key.Key_Tab.value: "Tab",
+    Qt.Key.Key_Return.value: "Enter",
+    Qt.Key.Key_Backspace.value: "Backspace",
+    Qt.Key.Key_Delete.value: "Delete",
+    Qt.Key.Key_Insert.value: "Insert",
+    Qt.Key.Key_Home.value: "Home",
+    Qt.Key.Key_End.value: "End",
+    Qt.Key.Key_PageUp.value: "PageUp",
+    Qt.Key.Key_PageDown.value: "PageDown",
+    Qt.Key.Key_Left.value: "Left",
+    Qt.Key.Key_Up.value: "Up",
+    Qt.Key.Key_Right.value: "Right",
+    Qt.Key.Key_Down.value: "Down",
+})
+
+
+class HotkeyEdit(QLineEdit):
+    """点一下、按一组键，就把这组键记下来的输入框。"""
+
+    def __init__(self, shortcut: str = "", parent=None):
+        super().__init__(shortcut, parent)
+        self.setReadOnly(True)
+        self.setPlaceholderText("点这里，再按下要用的组合键")
+        self.setToolTip(
+            "至少要有一个 Ctrl / Alt / Shift / Win；单独一个 F1~F24 也认。"
+            "按 Esc、退格或 Delete 清空，表示不启用快捷键。"
+        )
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def keyPressEvent(self, event):
+        key = event.key()
+        if key in (
+            Qt.Key.Key_Control, Qt.Key.Key_Alt, Qt.Key.Key_AltGr,
+            Qt.Key.Key_Shift, Qt.Key.Key_Meta, Qt.Key.Key_CapsLock,
+        ):
+            return          # 只按住修饰键还不算，等真正按下主键
+        if key in (Qt.Key.Key_Escape, Qt.Key.Key_Backspace, Qt.Key.Key_Delete):
+            self.setText("")
+            return
+        name = _KEY_NAMES.get(int(key))
+        if name is None:
+            return
+        mods = event.modifiers()
+        parts = []
+        if mods & Qt.KeyboardModifier.ControlModifier:
+            parts.append("Ctrl")
+        if mods & Qt.KeyboardModifier.AltModifier:
+            parts.append("Alt")
+        if mods & Qt.KeyboardModifier.ShiftModifier:
+            parts.append("Shift")
+        if mods & Qt.KeyboardModifier.MetaModifier:
+            parts.append("Win")
+        # 光秃秃的主键会抢走整机的这个按键，只有功能键可以单独用
+        if not parts and not name.startswith("F"):
+            return
+        parts.append(name)
+        self.setText("+".join(parts))
 
 
 def _to_qdate(day_str: str | None) -> QDate:
@@ -273,6 +354,53 @@ class DailyTaskDialog(_FormDialog):
         self.group_combo = _group_combo(groups, task.group_name if task else "")
         self.form.addRow("归属分组", self.group_combo)
 
+        # 重复周期：每天 / 每周固定星期几 / 每月固定几号
+        self.repeat_combo = QComboBox()
+        for value, label in REPEAT_CHOICES:
+            self.repeat_combo.addItem(label, value)
+        current_repeat = task.repeat if task else REPEAT_DAILY
+        repeat_index = self.repeat_combo.findData(current_repeat)
+        self.repeat_combo.setCurrentIndex(repeat_index if repeat_index >= 0 else 0)
+        self.repeat_combo.setToolTip(
+            "每天：天天都出现；每周：只在选定的星期几出现；每月：只在选定的几号出现"
+        )
+        self.form.addRow("重复周期", self.repeat_combo)
+
+        # 每周的星期几 / 每月的几号：两个控件放进同一行，按周期切换显示
+        today = QDate.currentDate()
+        self.weekday_combo = QComboBox()
+        for index, name in enumerate(WEEKDAY_NAMES):
+            self.weekday_combo.addItem(name, index)
+        default_weekday = (today.dayOfWeek() - 1) % 7
+        if task and task.repeat == REPEAT_WEEKLY:
+            default_weekday = int(task.repeat_day) % 7
+        self.weekday_combo.setCurrentIndex(default_weekday)
+        self.weekday_combo.setToolTip("选它固定在星期几出现")
+
+        self.month_spin = QSpinBox()
+        self.month_spin.setRange(1, 31)
+        self.month_spin.setSuffix(" 号")
+        default_month_day = today.day()
+        if task and task.repeat == REPEAT_MONTHLY and 1 <= int(task.repeat_day) <= 31:
+            default_month_day = int(task.repeat_day)
+        self.month_spin.setValue(default_month_day)
+        self.month_spin.setToolTip("选它固定在每月几号出现；当月没有该日时落在当月最后一天")
+
+        self.repeat_hint = QLabel("每天都会出现")
+        self.repeat_hint.setObjectName("FieldHint")
+
+        self.repeat_detail = QWidget()
+        detail_row = QHBoxLayout(self.repeat_detail)
+        detail_row.setContentsMargins(0, 0, 0, 0)
+        detail_row.setSpacing(8)
+        detail_row.addWidget(self.weekday_combo, 0)
+        detail_row.addWidget(self.month_spin, 0)
+        detail_row.addWidget(self.repeat_hint, 0)
+        detail_row.addStretch(1)
+        self.form.addRow("出现于", self.repeat_detail)
+        self.repeat_combo.currentIndexChanged.connect(self._sync_repeat_detail)
+        self._sync_repeat_detail()
+
         self.deadline_check = QCheckBox("启用")
         self.deadline_check.setChecked(bool(task and task.has_deadline))
         self.deadline_check.setToolTip("勾选后进入首页「刻不容缓」，否则进入「案无留牍」")
@@ -302,12 +430,26 @@ class DailyTaskDialog(_FormDialog):
 
         self.title_edit.setFocus()
 
+    def _sync_repeat_detail(self) -> None:
+        """按当前周期显示对应的细节控件：每天只留一句说明。"""
+        repeat = self.repeat_combo.currentData()
+        self.weekday_combo.setVisible(repeat == REPEAT_WEEKLY)
+        self.month_spin.setVisible(repeat == REPEAT_MONTHLY)
+        self.repeat_hint.setVisible(repeat == REPEAT_DAILY)
+
     def validate(self) -> str:
         if not self.title_edit.text().strip():
             return "请填写任务名称。"
         return ""
 
     def values(self) -> dict:
+        repeat = self.repeat_combo.currentData()
+        if repeat == REPEAT_WEEKLY:
+            repeat_day = int(self.weekday_combo.currentData())
+        elif repeat == REPEAT_MONTHLY:
+            repeat_day = self.month_spin.value()
+        else:
+            repeat_day = 0
         return {
             "title": self.title_edit.text().strip(),
             "group_name": _group_value(self.group_combo),
@@ -319,6 +461,8 @@ class DailyTaskDialog(_FormDialog):
             "note": self.note_edit.toPlainText().strip(),
             "backlog": self.backlog_check.isChecked(),
             "remind_minutes": self.remind_spin.value(),
+            "repeat": repeat,
+            "repeat_day": repeat_day,
         }
 
 
@@ -452,7 +596,8 @@ class SettingsDialog(_FormDialog):
     def __init__(self, default_remind: int = DEFAULT_REMIND_MINUTES,
                  remind_mode: str = "", sound_enabled: bool = True,
                  sound_choice: str = "", sound_files: list[str] | None = None,
-                 nav_position: str = NAV_TOP, parent=None):
+                 nav_position: str = NAV_TOP,
+                 new_note_hotkey: str = DEFAULT_NEW_NOTE_HOTKEY, parent=None):
         super().__init__("设置", parent)
         self.setMinimumWidth(520)
 
@@ -481,7 +626,7 @@ class SettingsDialog(_FormDialog):
         add_audio = QPushButton("添加音频…")
         add_audio.setObjectName("GhostButton")
         add_audio.setCursor(Qt.CursorShape.PointingHandCursor)
-        add_audio.setToolTip("添加本地 wav 音频，之后可以在左侧下拉里选中使用")
+        add_audio.setToolTip("从别处挑一个 wav / mp3 音频，之后可以在左侧下拉里选中使用")
         add_audio.clicked.connect(self._add_sound_file)
 
         preview = QPushButton("试听")
@@ -499,6 +644,17 @@ class SettingsDialog(_FormDialog):
         row.addWidget(preview, 0)
         self.form.addRow("提醒音频", audio_row)
 
+        # 铃声文件夹：用户把音乐丢进去，这里扫描出来后即可在下拉里选
+        open_folder = QPushButton("打开铃声文件夹")
+        open_folder.setObjectName("GhostButton")
+        open_folder.setCursor(Qt.CursorShape.PointingHandCursor)
+        open_folder.setToolTip(
+            "把 wav / mp3 音乐放进程序目录下的「铃声」文件夹，"
+            "回来重开本设置即可在下拉里选中：\n" + str(ensure_sound_dir())
+        )
+        open_folder.clicked.connect(self._open_sound_folder)
+        self.form.addRow(open_folder)
+
         self.nav_combo = QComboBox()
         for value, label in NAV_POSITIONS:
             self.nav_combo.addItem(label, value)
@@ -506,32 +662,64 @@ class SettingsDialog(_FormDialog):
         self.nav_combo.setCurrentIndex(index if index >= 0 else 0)
         self.form.addRow("导航位置", self.nav_combo)
 
+        self.hotkey_edit = HotkeyEdit(new_note_hotkey)
+        self.form.addRow("便签快捷键", self.hotkey_edit)
+
         hint = QLabel(
             "默认提前提醒是新建有时限任务时提醒输入框的初始值，单条任务里仍可单独改；"
             "填 0 表示默认不提醒。\n"
-            "导航位置决定「今日一览 / 备忘录」的切换按钮摆在窗口顶部还是左侧。"
+            "提醒音频支持系统音与 wav / mp3：把音乐放进「铃声」文件夹，"
+            "或点「添加音频…」挑一个文件，都能在下拉里选中。\n"
+            "导航位置决定「今日一览 / 备忘录」的切换按钮摆在窗口顶部还是左侧。\n"
+            "便签快捷键在任何程序里按下都管用：直接在鼠标位置开一张桌面便签。"
+            "点一下输入框再按一组键即可记录，按 Esc 清空表示不启用。"
         )
         hint.setObjectName("FieldHint")
         hint.setWordWrap(True)
         self.form.addRow(hint)
 
+    def validate(self) -> str:
+        text = self.hotkey_edit.text().strip()
+        if text and parse(text) is None:
+            return "快捷键至少要有一个 Ctrl / Alt / Shift / Win；单独一个 F1~F24 也可以。"
+        return ""
+
+    def _sound_candidates(self) -> list[str]:
+        """可选的本地音频：程序目录「铃声」文件夹里的 + 用户另外添加过的，去重。"""
+        files: list[str] = []
+        for path in list_sound_files() + self.sound_files:
+            if path and path not in files:
+                files.append(path)
+        return files
+
     def _fill_sound_combo(self, choice: str) -> None:
-        """填一遍可选音频：系统音 + 已添加的本地文件，并选中当前那一项。"""
+        """填一遍可选音频：系统音 + 本地音频，并选中当前那一项。"""
         self.sound_combo.clear()
         for alias, label in SYSTEM_SOUNDS:
             self.sound_combo.addItem(label, alias_choice(alias))
-        for path in self.sound_files:
+        for path in self._sound_candidates():
             self.sound_combo.addItem(choice_label(file_choice(path)), file_choice(path))
         index = self.sound_combo.findData(choice or DEFAULT_CHOICE)
         self.sound_combo.setCurrentIndex(index if index >= 0 else 0)
 
     def _add_sound_file(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "选择提醒音频", "", AUDIO_FILTER)
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择提醒音频", str(ensure_sound_dir()), AUDIO_FILTER
+        )
         if not path:
             return
         if path not in self.sound_files:
             self.sound_files.append(path)
         self._fill_sound_combo(file_choice(path))
+
+    def _open_sound_folder(self) -> None:
+        """打开「铃声」文件夹；用户放完音乐回来，重新扫描一遍供选择。"""
+        folder = ensure_sound_dir()
+        try:
+            os.startfile(str(folder))
+        except OSError:
+            pass
+        self._fill_sound_combo(self.sound_combo.currentData() or DEFAULT_CHOICE)
 
     def _preview_sound(self) -> None:
         play_remind_sound(self.sound_combo.currentData() or "")
@@ -544,4 +732,5 @@ class SettingsDialog(_FormDialog):
             "sound_choice": self.sound_combo.currentData() or "",
             "sound_files": list(self.sound_files),
             "nav_position": self.nav_combo.currentData(),
+            "new_note_hotkey": self.hotkey_edit.text().strip(),
         }

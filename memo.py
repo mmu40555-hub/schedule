@@ -5,12 +5,19 @@
 - 允许简单重叠；与另一张重叠面积过大时松手，两张就叠成一摞
 - 叠起来后画布上只留一张，右侧一列小页签切换浏览，一摞最多五张
 - 页签右键能把某张移出这一摞，便签右键可以拆开整摞或删掉
-- 便签可以直接拖出主窗口：一出窗口边沿就当场变成桌面浮窗、一路跟手走，松手
-  落在哪儿就钉在哪儿，浏览器、游戏启动器乃至光秃秃的桌面之上都浮得住
+- 便签可以直接拖出主窗口：一出窗口边沿就当场变成桌面浮窗、一路跟手走；
+  松手时压在哪个程序窗口上，就钉在哪个窗口上（浏览器、游戏启动器都行），
+  底下要是光秃秃的桌面，那就只是浮在桌面最上层
+- 钉在窗口上的便签跟那个窗口联动：窗口挪它跟着挪，窗口最小化它一并藏起来，
+  窗口关掉它自己收回备忘录页面；拖得离那个窗口足够远，就自动改回普通浮窗
+- 便签右键「钉到某个窗口…」也可以先指定再贴：选完点一下目标窗口即可
 - 便签右上角的「钉」也能把它钉到桌面上（会挪到主窗口右边），再点一下收回页面
 """
 
-from PyQt6.QtCore import QPoint, QRect, Qt, pyqtSignal
+import ctypes
+from ctypes import wintypes
+
+from PyQt6.QtCore import QPoint, QRect, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QCursor, QFontMetrics, QPainter, QTextCursor
 from PyQt6.QtWidgets import (
     QApplication,
@@ -63,6 +70,195 @@ TAB_SPACING = 2
 STRIP_GAP = 6
 
 PLACEHOLDER = "点一下写点什么…"
+
+# 便签盯着宿主窗口看的间隔；窗口一挪便签就跟上，靠的就是这个心跳
+HOST_TICK_MS = 60
+# 拾取宿主窗口时，查鼠标左右键的间隔
+PICK_TICK_MS = 40
+
+# ---------------- 和别的程序窗口打交道 ----------------
+#
+# 「钉在某个程序窗口上」全靠下面这几个原生调用实现。这里刻意不去设窗口的
+# owner：owner 关系下宿主一关，便签会被系统连带销毁，Qt 那边会留下一个
+# 自己都不知道已经没了的窗口。改成自己盯着宿主，四条联动都由自己拿主意：
+#   位置跟着走、最小化一并藏、关掉就收回、Z 序压在宿主之上
+
+GA_ROOT = 2
+GW_HWNDNEXT = 2
+GW_HWNDPREV = 3
+GWL_EXSTYLE = -20
+WS_EX_TOPMOST = 0x00000008
+WS_EX_TRANSPARENT = 0x00000020
+HWND_TOP = 0
+HWND_TOPMOST = -1
+HWND_NOTOPMOST = -2
+SWP_NOSIZE = 0x0001
+SWP_NOMOVE = 0x0002
+SWP_NOACTIVATE = 0x0010
+
+VK_LBUTTON = 0x01
+VK_RBUTTON = 0x02
+VK_ESCAPE = 0x1B
+
+# 桌面本身不算「别的程序窗口」：钉在桌面上就该是普通浮窗
+DESKTOP_CLASSES = {"Progman", "WorkerW", "Shell_TrayWnd", "SysListView32"}
+
+_user32 = ctypes.windll.user32
+_user32.WindowFromPoint.argtypes = [wintypes.POINT]
+_user32.WindowFromPoint.restype = wintypes.HWND
+_user32.GetAncestor.argtypes = [wintypes.HWND, ctypes.c_uint]
+_user32.GetAncestor.restype = wintypes.HWND
+_user32.GetWindow.argtypes = [wintypes.HWND, ctypes.c_uint]
+_user32.GetWindow.restype = wintypes.HWND
+_user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+_user32.SetWindowPos.argtypes = [
+    wintypes.HWND,
+    wintypes.HWND,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_uint,
+]
+# 32 位系统上这两个叫 ...LongW，64 位上是 ...LongPtrW；按位宽选对的那个
+_GetWindowLong = getattr(_user32, "GetWindowLongPtrW", _user32.GetWindowLongW)
+_SetWindowLong = getattr(_user32, "SetWindowLongPtrW", _user32.SetWindowLongW)
+_GetWindowLong.argtypes = [wintypes.HWND, ctypes.c_int]
+_GetWindowLong.restype = ctypes.c_ssize_t
+_SetWindowLong.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t]
+_SetWindowLong.restype = ctypes.c_ssize_t
+
+
+def hwnd_of(widget: QWidget) -> int:
+    """Qt 控件的原生窗口句柄。"""
+    return int(widget.winId())
+
+
+def top_hwnd(hwnd: int) -> int:
+    """从一个子窗口往上找到它所属的顶层窗口。"""
+    if not hwnd:
+        return 0
+    return int(_user32.GetAncestor(wintypes.HWND(hwnd), GA_ROOT) or hwnd)
+
+
+def hwnd_at(x: int, y: int) -> int:
+    """屏幕上这一点压着哪个顶层窗口；没有就是 0。"""
+    found = _user32.WindowFromPoint(wintypes.POINT(int(x), int(y)))
+    return top_hwnd(int(found or 0))
+
+
+def window_under(widget: QWidget) -> int:
+    """便签正盖着的那个别人家的窗口；盖着的是桌面或自家窗口就返回 0。
+
+    便签自己就压在这一点上，直接问系统只会问回自己。先把便签设成「鼠标穿透」，
+    系统就会跳过它、告诉底下压着谁；问完马上恢复，外观与手感都不变。
+    """
+    hwnd = wintypes.HWND(hwnd_of(widget))
+    style = int(_GetWindowLong(hwnd, GWL_EXSTYLE))
+    _SetWindowLong(hwnd, GWL_EXSTYLE, style | WS_EX_TRANSPARENT)
+    try:
+        center = widget.mapToGlobal(QPoint(0, 0)) + QPoint(
+            widget.width() // 2, widget.height() // 2
+        )
+        found = hwnd_at(center.x(), center.y())
+    finally:
+        _SetWindowLong(hwnd, GWL_EXSTYLE, style)
+    if not found or found in own_windows() or is_desktop(found):
+        return 0
+    return found
+
+
+def own_windows() -> set[int]:
+    """本程序自己的所有顶层窗口，找宿主时都要跳过。"""
+    ids = set()
+    for widget in QApplication.topLevelWidgets():
+        if widget.isVisible():
+            ids.add(int(widget.winId()))
+    return ids
+
+
+def window_rect(hwnd: int) -> QRect | None:
+    rect = wintypes.RECT()
+    if not _user32.GetWindowRect(wintypes.HWND(hwnd), ctypes.byref(rect)):
+        return None
+    return QRect(rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top)
+
+
+def window_alive(hwnd: int) -> bool:
+    return bool(hwnd) and bool(_user32.IsWindow(wintypes.HWND(hwnd)))
+
+
+def window_minimized(hwnd: int) -> bool:
+    return bool(_user32.IsIconic(wintypes.HWND(hwnd)))
+
+
+def window_class(hwnd: int) -> str:
+    buf = ctypes.create_unicode_buffer(256)
+    _user32.GetClassNameW(wintypes.HWND(hwnd), buf, 256)
+    return buf.value
+
+
+def is_desktop(hwnd: int) -> bool:
+    """是不是系统桌面 / 任务栏本身；这种不算「别的程序窗口」。"""
+    return bool(hwnd) and window_class(hwnd) in DESKTOP_CLASSES
+
+
+def window_title(hwnd: int) -> str:
+    length = int(_user32.GetWindowTextLengthW(wintypes.HWND(hwnd)))
+    buf = ctypes.create_unicode_buffer(length + 1)
+    _user32.GetWindowTextW(wintypes.HWND(hwnd), buf, length + 1)
+    return buf.value
+
+
+def find_window(cls: str, title: str) -> int:
+    """照类名 + 标题把宿主窗口找回来（下次开程序时接着贴）。"""
+    if not cls and not title:
+        return 0
+    found = _user32.FindWindowW(cls or None, title or None)
+    return int(found or 0)
+
+
+def put_above(widget: QWidget, host: int) -> None:
+    """把便签插到宿主的 Z 序正上方：压在它上头，但不盖住别的程序。
+
+    当心 SetWindowPos 的第二个参数是「排在便签前面（也就是压在便签上）的那个
+    窗口」，直接传宿主会把便签塞到宿主下面去。所以要取宿主上面贴着的那一个，
+    把便签插在它后头；宿主本身就是最上层时就干脆摆到顶层。
+    前提是便签自己没有 WS_EX_TOPMOST——带着它这套插队会被系统直接忽略。
+    """
+    hwnd = wintypes.HWND(hwnd_of(widget))
+    preceding = int(_user32.GetWindow(wintypes.HWND(host), GW_HWNDPREV) or 0)
+    if preceding and not (
+        _GetWindowLong(wintypes.HWND(preceding), GWL_EXSTYLE) & WS_EX_TOPMOST
+    ):
+        after = wintypes.HWND(preceding)
+    else:
+        after = wintypes.HWND(HWND_TOP)
+    _user32.SetWindowPos(
+        hwnd, after, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
+    )
+
+
+def set_topmost(widget: QWidget, on: bool) -> None:
+    """给便签窗口加 / 去 WS_EX_TOPMOST。
+
+    Qt 的 WindowStaysOnTopHint 设出来的就是这个样式。贴到宿主窗口上时要摘掉，
+    否则便签永远是整屏最上层，谈不上「压在宿主之上、但不盖住别的程序」。
+    已经是想要的样式就直接返回，这样可以放心地按心跳反复喊。
+    """
+    hwnd = wintypes.HWND(hwnd_of(widget))
+    style = int(_GetWindowLong(hwnd, GWL_EXSTYLE))
+    if bool(style & WS_EX_TOPMOST) == on:
+        return
+    new = (style | WS_EX_TOPMOST) if on else (style & ~WS_EX_TOPMOST)
+    _SetWindowLong(hwnd, GWL_EXSTYLE, new)
+    # 光改样式不够，还得让系统重新排一次 Z 序才会生效
+    _user32.SetWindowPos(hwnd, wintypes.HWND(HWND_TOPMOST if on else HWND_NOTOPMOST),
+                         0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+
+
+def key_down(vk: int) -> bool:
+    return bool(_user32.GetAsyncKeyState(vk) & 0x8000)
 
 
 def _repolish(widget: QWidget) -> None:
@@ -155,6 +351,9 @@ class StickyNote(QFrame):
     pin_requested = pyqtSignal(int, QPoint)    # 钉到桌面，附带落点（屏幕坐标）
     unpin_requested = pyqtSignal(int)          # 从桌面收回页面
     dragged_out = pyqtSignal(int)              # 拖着拖着出了主窗口，该转成桌面浮窗
+    host_changed = pyqtSignal(int)             # 贴上了 / 摘下了宿主窗口
+    host_lost = pyqtSignal(int)                # 宿主窗口没了，请把它收回页面
+    pick_requested = pyqtSignal(int)           # 右键选了「钉到某个窗口…」
     delete_requested = pyqtSignal(int)
     detach_requested = pyqtSignal(int)    # 从这一摞里拿出来
     split_requested = pyqtSignal(int)     # 拆开整摞
@@ -169,6 +368,11 @@ class StickyNote(QFrame):
         self._editing = False
         self._hopped_out = False        # 这次拖动是从画布上跳出去的
         self._grabbed = False           # 为了拖动不断线，临时抓了鼠标
+        self._host = 0                  # 贴在哪个窗口上（0 就是块普通浮窗）
+        self._host_dx = 0               # 便签左上角与宿主左上角的横距
+        self._host_dy = 0
+        self._tick: QTimer | None = None    # 盯着宿主看的心跳
+        self._parked = False            # 主窗口缩到后台，被页面收起来了
 
         # 名字要赶在挂样式表之前定下来：样式表按 objectName 匹配，晚了就对不上
         self.setObjectName("StickyNote")
@@ -220,10 +424,21 @@ class StickyNote(QFrame):
         self.setWindowTitle("便签")
 
     def _refresh_tip(self) -> None:
+        if not self.desk:
+            self.setToolTip(
+                "单击改内容，按住拖动挪位置；拖到别的便签上大面积重叠会叠成一摞"
+            )
+            return
+        if self._host:
+            self.setToolTip(
+                f"已贴在「{window_title(self._host) or window_class(self._host)}」上："
+                "它挪窝便签跟着挪，它缩下去便签也藏起来。"
+                "拖离这个窗口就不贴了，点右上角的钉收回备忘录页面"
+            )
+            return
         self.setToolTip(
-            "单击改内容，按住拖动挪位置；点右上角的钉能收回备忘录页面"
-            if self.desk
-            else "单击改内容，按住拖动挪位置；拖到别的便签上大面积重叠会叠成一摞"
+            "单击改内容，按住拖动挪位置；拖到别的程序窗口上松手就贴住它，"
+            "点右上角的钉收回备忘录页面"
         )
 
     def go_desk(self) -> None:
@@ -249,6 +464,116 @@ class StickyNote(QFrame):
         """取走「这次是从画布上跳出去的」标记。"""
         hopped, self._hopped_out = self._hopped_out, False
         return hopped
+
+    # ---------- 贴在别的程序窗口上 ----------
+
+    @property
+    def host(self) -> int:
+        """当前贴着的宿主窗口；0 表示没贴，就是块普通浮窗。"""
+        return self._host
+
+    @property
+    def host_offset(self) -> tuple[int, int]:
+        return self._host_dx, self._host_dy
+
+    def attach_to(self, hwnd: int, dx: int | None = None, dy: int | None = None) -> bool:
+        """把便签贴到某个程序窗口上，从此跟它一条心。
+
+        dx / dy 不传就照便签眼下压的位置算，也就是「就贴在这儿」。
+        """
+        if not self.desk or not window_alive(hwnd) or is_desktop(hwnd):
+            return False
+        rect = window_rect(hwnd)
+        if rect is None:
+            return False
+        self._host = hwnd
+        self._host_dx = self.x() - rect.x() if dx is None else int(dx)
+        self._host_dy = self.y() - rect.y() if dy is None else int(dy)
+        # 摘掉「整屏置顶」，接下来靠 put_above 插到宿主的 Z 序正上方
+        set_topmost(self, False)
+        self._sync_with_host(force=True)
+        self._start_tick()
+        self._refresh_tip()
+        self.host_changed.emit(self.memo.id)
+        return True
+
+    def detach_host(self) -> None:
+        """从宿主窗口上摘下来，变回一块普通浮窗。"""
+        if not self._host:
+            return
+        self._host = 0
+        self._stop_tick()
+        # 不再跟谁一条心了，恢复成整屏置顶的普通浮窗
+        set_topmost(self, True)
+        self._refresh_tip()
+        self.host_changed.emit(self.memo.id)
+
+    def _start_tick(self) -> None:
+        if self._tick is None:
+            self._tick = QTimer(self)
+            self._tick.setInterval(HOST_TICK_MS)
+            self._tick.timeout.connect(self._sync_with_host)
+        self._tick.start()
+
+    def _stop_tick(self) -> None:
+        if self._tick is not None:
+            self._tick.stop()
+
+    def _sync_with_host(self, force: bool = False) -> None:
+        """看一眼宿主：还在不在、挪没挪窝、有没有缩到任务栏去。"""
+        if not self._host:
+            return
+        if not window_alive(self._host):
+            # 人家关掉了：这张便签回备忘录页面去
+            self._host = 0
+            self._stop_tick()
+            self.host_lost.emit(self.memo.id)
+            return
+        if self._parked:
+            return
+        if not force and (self._dragging or self._press_at is not None or self._editing):
+            # 正拖着或正写着：这会儿便签听手的，不听宿主的
+            return
+        if window_minimized(self._host):
+            if self.isVisible():
+                self.hide()
+            return
+        rect = window_rect(self._host)
+        if rect is None:
+            return
+        target = QPoint(rect.x() + self._host_dx, rect.y() + self._host_dy)
+        if not self.isVisible():
+            self.move(target)
+            self.show()
+        elif self.pos() != target:
+            self.move(target)
+        # 露面的动作可能又把「整屏置顶」带回来，插队之前先确认摘干净了
+        set_topmost(self, False)
+        put_above(self, self._host)
+
+    def _still_on_host(self) -> bool:
+        """便签中心还压在宿主窗口上吗；拖出去之后中心就露到外面了。"""
+        rect = window_rect(self._host)
+        if rect is None:
+            return False
+        return rect.contains(QRect(self.pos(), self.size()).center())
+
+    def park(self) -> None:
+        """主窗口缩到后台：先把便签收起来，宿主那边别急着叫醒它。"""
+        self._parked = True
+        self.hide()
+
+    def unpark(self) -> None:
+        self._parked = False
+        if self._host and window_minimized(self._host):
+            return          # 宿主还缩着，等它还原再露面
+        self.show()
+        self.raise_()
+
+    def shutdown(self) -> None:
+        """这张便签要销毁了：先把盯着宿主看的心跳停掉。"""
+        self._stop_tick()
+        self._host = 0
 
     # ---------- 内容与尺寸 ----------
 
@@ -394,6 +719,9 @@ class StickyNote(QFrame):
             self.dragged_out.emit(self.memo.id)
 
         self._follow(position)
+        if self._host and not self._still_on_host():
+            # 拖得离开了宿主窗口：这张就不贴着了，变回普通浮窗
+            self.detach_host()
         self.moved.emit(self.memo.id)
         event.accept()
 
@@ -429,6 +757,12 @@ class StickyNote(QFrame):
         self._press_at = None
         if self._dragging:
             self._dragging = False
+            if self._host:
+                # 还贴在人家身上：位置动了，相对位置跟着更新一下
+                rect = window_rect(self._host)
+                if rect is not None:
+                    self._host_dx = self.x() - rect.x()
+                    self._host_dy = self.y() - rect.y()
             dropped = self._drop_outside(pressed_at)
             if dropped is None:
                 self.drag_finished.emit(self.memo.id)
@@ -457,6 +791,12 @@ class StickyNote(QFrame):
         menu = QMenu(self)
         menu.addAction("编辑内容", lambda: self.click_edit.emit(self.memo.id))
         if self.desk:
+            if self._host:
+                menu.addAction("不贴在窗口上", self.detach_host)
+            else:
+                menu.addAction(
+                    "钉到某个窗口…", lambda: self.pick_requested.emit(self.memo.id)
+                )
             menu.addAction("收回备忘录页面", self._on_pin_clicked)
         else:
             menu.addAction("新建便签", lambda: self.create_requested.emit())
@@ -470,6 +810,28 @@ class StickyNote(QFrame):
         menu.addSeparator()
         menu.addAction("删除便签", lambda: self.delete_requested.emit(self.memo.id))
         menu.exec(event.globalPos())
+
+
+class _PickHint(QLabel):
+    """挑宿主窗口时跟着鼠标跑的小提示条。"""
+
+    def __init__(self):
+        super().__init__(
+            None,
+            Qt.WindowType.Tool
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.WindowDoesNotAcceptFocus,
+        )
+        self.setObjectName("PickHint")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        self.setStyleSheet(APP_QSS)         # 独立顶层浮层，样式表要自己挂一份
+        self.setText("点一下要钉住的窗口（按 Esc 取消）")
+        self.adjustSize()
+
+    def follow(self, point: QPoint) -> None:
+        self.move(point.x() + 18, point.y() + 20)
 
 
 class TabStrip(QWidget):
@@ -532,6 +894,11 @@ class MemoPage(QWidget):
         # 钉到桌面的便签：一张一个独立小窗，键是便签 id
         self.desk: dict[int, StickyNote] = {}
         self._desk_hidden = False
+        # 挑宿主窗口：_picking 是正在挑的那张便签，_pick_armed 是等上一次按下的手抬起来
+        self._picking = 0
+        self._pick_armed = False
+        self._pick_timer: QTimer | None = None
+        self._pick_hint: _PickHint | None = None
         self._reloading = False
 
         root = QVBoxLayout(self)
@@ -671,15 +1038,30 @@ class MemoPage(QWidget):
         note.edited.connect(self._on_note_edited)
         note.click_edit.connect(self._on_desk_clicked)
         note.unpin_requested.connect(self._on_unpin)
+        note.host_changed.connect(self._on_host_changed)
+        note.host_lost.connect(self._on_host_lost)
+        note.pick_requested.connect(self._begin_pick)
         note.delete_requested.connect(self._on_delete)
         self.desk[memo.id] = note
-        if not self._desk_hidden:
+        if self._desk_hidden:
+            note.park()
+        else:
             note.show()
+        self._restore_host(note, memo)
+
+    def _restore_host(self, note: StickyNote, memo: Memo) -> None:
+        """上次贴着的那个窗口要是还开着，就把便签重新贴回去。"""
+        if not memo.host_class and not memo.host_title:
+            return
+        host = find_window(memo.host_class, memo.host_title)
+        if host and window_alive(host) and not is_desktop(host):
+            note.attach_to(host, memo.host_dx, memo.host_dy)
 
     def _close_desk(self, memo_id: int) -> None:
         note = self.desk.pop(memo_id, None)
         if note is None:
             return
+        note.shutdown()
         note.hide()
         note.setParent(None)
         note.deleteLater()
@@ -699,6 +1081,12 @@ class MemoPage(QWidget):
             self._on_unpin(memo_id)
             return
         self.store.save_memo_pos(memo_id, note.x(), note.y())
+        if note.host:
+            # 还贴在原来那个窗口上：位置挪了，相对位置存一下
+            self._on_host_changed(memo_id)
+        else:
+            # 松手时便签压在哪个程序窗口上，就此贴住它
+            self._attach_under(note)
 
     def _on_dragged_out(self, memo_id: int) -> None:
         """便签被拖出了主窗口：就地转成桌面浮窗，接着跟手走。
@@ -717,6 +1105,9 @@ class MemoPage(QWidget):
         self.store.set_memo_pinned(memo_id, True)     # 会顺手把它从原来那摞里摘出来
         note.memo.pinned = 1
         note.unpin_requested.connect(self._on_unpin)  # 转过去之后，钉按钮得能收回来
+        note.host_changed.connect(self._on_host_changed)
+        note.host_lost.connect(self._on_host_lost)
+        note.pick_requested.connect(self._begin_pick)
         self.desk[memo_id] = note
         note.go_desk()
         # 同摞剩下的、页签序号要重排；这张已经不在画布名单里，重建时不会被删掉
@@ -738,7 +1129,11 @@ class MemoPage(QWidget):
         self.store.set_memo_pinned(memo_id, True)
         landing = self._desk_spot(spot)
         self.store.save_memo_pos(memo_id, landing.x(), landing.y())
+        self.store.save_memo_host(memo_id)      # 新钉出来的先算没贴着谁，贴不贴看落点
         self.reload()
+        note = self.desk.get(memo_id)
+        if note is not None:
+            self._attach_under(note)
 
     def _desk_spot(self, spot: QPoint) -> QPoint:
         """钉住后的落点：主窗口右边优先，右边挤不下就摆到下边。"""
@@ -765,7 +1160,86 @@ class MemoPage(QWidget):
         spot = self.canvas_pos(note.pos())
         self.store.set_memo_pinned(memo_id, False)
         self.store.save_memo_pos(memo_id, spot.x(), spot.y())
+        self.store.save_memo_host(memo_id)      # 回页面了，就不再贴着谁的窗口
         self.reload()
+
+    # ---------- 贴着的是哪个窗口 ----------
+
+    def _on_host_changed(self, memo_id: int) -> None:
+        """便签贴上了谁、或者从谁身上摘下来了，把这件事记进库。"""
+        note = self.desk.get(memo_id)
+        if note is None:
+            return
+        if not note.host:
+            self.store.save_memo_host(memo_id)
+            return
+        rect = window_rect(note.host)
+        if rect is None:
+            self.store.save_memo_host(memo_id)
+            return
+        dx, dy = note.host_offset
+        self.store.save_memo_host(
+            memo_id, window_class(note.host), window_title(note.host), dx, dy
+        )
+
+    def _on_host_lost(self, memo_id: int) -> None:
+        """贴着的那个窗口关掉了：便签自己回备忘录页面去。"""
+        self._on_unpin(memo_id)
+
+    def _attach_under(self, note: StickyNote) -> bool:
+        """便签正盖着别人家的窗口就贴上去；盖着的是桌面或自家窗口就不贴。"""
+        host = window_under(note)
+        return bool(host) and note.attach_to(host)
+
+    # ---------- 挑一个窗口贴上去 ----------
+
+    def _begin_pick(self, memo_id: int) -> None:
+        """右键选了「钉到某个窗口…」：接下来点哪个窗口，便签就贴上去。"""
+        note = self.desk.get(memo_id)
+        if note is None:
+            return
+        self._picking = memo_id
+        self._pick_armed = False        # 菜单点完那只手可能还按着，先等它抬起来
+        if self._pick_hint is None:
+            self._pick_hint = _PickHint()
+        self._pick_hint.follow(QCursor.pos())
+        self._pick_hint.show()
+        if self._pick_timer is None:
+            self._pick_timer = QTimer(self)
+            self._pick_timer.setInterval(PICK_TICK_MS)
+            self._pick_timer.timeout.connect(self._poll_pick)
+        self._pick_timer.start()
+
+    def _poll_pick(self) -> None:
+        """等用户去点一下目标窗口。"""
+        note = self.desk.get(self._picking)
+        if note is None:
+            self._end_pick()
+            return
+        point = QCursor.pos()
+        if self._pick_hint is not None:
+            self._pick_hint.follow(point)
+        if key_down(VK_ESCAPE) or key_down(VK_RBUTTON):
+            self._end_pick()
+            return
+        if not self._pick_armed:
+            self._pick_armed = not key_down(VK_LBUTTON)
+            return
+        if not key_down(VK_LBUTTON):
+            return
+        host = hwnd_at(point.x(), point.y())
+        if not host or is_desktop(host) or host in own_windows():
+            return          # 点在自己身上或桌面上：这次不算，接着挑
+        note.attach_to(host)
+        self._end_pick()
+
+    def _end_pick(self) -> None:
+        self._picking = 0
+        self._pick_armed = False
+        if self._pick_timer is not None:
+            self._pick_timer.stop()
+        if self._pick_hint is not None:
+            self._pick_hint.hide()
 
     def canvas_pos(self, screen_point: QPoint) -> QPoint:
         """屏幕上这点对应画布里的哪一格。
@@ -788,18 +1262,19 @@ class MemoPage(QWidget):
     def hide_desktop_notes(self) -> None:
         """主窗口缩到后台：桌面上的便签跟着一起收起来。"""
         self._desk_hidden = True
+        self._end_pick()
         for note in self.desk.values():
-            note.hide()
+            note.park()
 
     def show_desktop_notes(self) -> None:
         if not self._desk_hidden:
             return
         self._desk_hidden = False
         for note in self.desk.values():
-            note.show()
-            note.raise_()
+            note.unpark()
 
     def close_desktop_notes(self) -> None:
+        self._end_pick()
         for memo_id in list(self.desk):
             self._close_desk(memo_id)
 
@@ -833,6 +1308,25 @@ class MemoPage(QWidget):
         note = self.note_of.get(new_id)
         if note is not None:
             note.begin_edit()
+
+    def create_desk_note(self, spot: QPoint) -> None:
+        """在屏幕上的某点直接摊一张桌面便签（全局快捷键走的就是这里）。
+
+        主窗口可能正缩在托盘里、桌面便签被一并藏着，所以这一张要单独露面：
+        是用户主动叫出来的，总得让人看见、能接着写。
+        """
+        x, y = int(spot.x()), int(spot.y())
+        memo_id = self.store.create_memo("", x, y)
+        self.store.set_memo_pinned(memo_id, True)
+        self.store.save_memo_pos(memo_id, x, y)
+        self.store.save_memo_host(memo_id)      # 刚开出来的，还没贴在谁身上
+        self.reload()
+        note = self.desk.get(memo_id)
+        if note is None:
+            return
+        note.unpark()
+        note.activateWindow()
+        note.begin_edit()
 
     def _on_note_edited(self, memo_id: int, text: str) -> None:
         self.store.update_memo_content(memo_id, text)

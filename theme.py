@@ -722,6 +722,16 @@ QTextEdit#StickyEdit {{
     border-color: #8D8D8D;
 }}
 
+/* 挑宿主窗口时跟着鼠标跑的提示条 */
+#PickHint {{
+    background: {TEXT_PRIMARY};
+    border: 1px solid {TEXT_PRIMARY};
+    border-radius: 6px;
+    padding: 6px 10px;
+    color: #FFFFFF;
+    font-size: 12px;
+}}
+
 /* 一摞便签右侧的竖排小页签 */
 #TabStrip {{
     background: transparent;

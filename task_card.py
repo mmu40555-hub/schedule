@@ -16,7 +16,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from models import COL_BACKLOG, SOURCE_LABEL, TodayItem
+from models import COL_BACKLOG, TodayItem
 from theme import ACCENT, SOURCE_COLOR, TEXT_DONE, TEXT_PRIMARY, rgba
 
 # 拖拽携带的数据："{column_id}:{item_key}"，item_key 形如 daily:3
@@ -212,7 +212,8 @@ class TaskCard(QFrame):
 
     def _source_chip(self) -> QLabel:
         color = SOURCE_COLOR[self.item.source]
-        chip = QLabel(SOURCE_LABEL[self.item.source])
+        # 每日任务按周期显示每日 / 每周 / 每月，其余按来源显示
+        chip = QLabel(self.item.source_label)
         chip.setStyleSheet(
             f"background: {rgba(color, 0.12)}; color: {color};"
             "border-radius: 4px; padding: 1px 6px; font-size: 11px;"
