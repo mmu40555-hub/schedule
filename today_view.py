@@ -285,7 +285,7 @@ class TodayView(QWidget):
 
     def _show_add_menu(self) -> None:
         menu = QMenu(self)
-        menu.addAction("长期每日任务", self._new_daily_task)
+        menu.addAction("长期任务", self._new_daily_task)
         menu.addAction("某日临时任务", self._new_once_task)
         menu.addAction("时期任务", self._new_period_task)
         menu.exec(self.add_button.mapToGlobal(self.add_button.rect().bottomLeft()))

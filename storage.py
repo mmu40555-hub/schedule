@@ -1116,6 +1116,26 @@ class Store:
         )
         self.conn.commit()
 
+    def merge_stack_into_one(self, stack_id: int, content: str) -> int | None:
+        """把整摞按页签序号合并成一整张，返回留下来的那张 id。
+
+        合并后的正文由调用方拼好传进来。留下来的那张沿用序号最靠前那张的位置，
+        其余几张并入后删掉，整张也就散成一摞之外的单独一张。
+        """
+        members = self.stack_members(stack_id)
+        if len(members) < 2:
+            return None
+        survivor = members[0]
+        for member in members[1:]:
+            self.conn.execute("DELETE FROM memos WHERE id=?", (member.id,))
+        self.conn.execute(
+            "UPDATE memos SET content=?, updated_day=?, stack_id=0, stack_order=0,"
+            " stack_active=1 WHERE id=?",
+            (content, date.today().isoformat(), survivor.id),
+        )
+        self.conn.commit()
+        return survivor.id
+
     def _stack_size(self, stack_id: int) -> int:
         """某一摞的张数；stack_id 为 0 时就是单独一张。"""
         if not stack_id:

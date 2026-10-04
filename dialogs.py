@@ -1,4 +1,4 @@
-"""三个任务编辑对话框：长期每日任务 / 某日临时任务 / 时期任务。"""
+"""三个任务编辑对话框：长期任务 / 某日临时任务 / 时期任务。"""
 
 import os
 
@@ -340,12 +340,12 @@ class StageListEditor(QWidget):
         self.hint.setVisible(not self.rows)
 
 
-# ---------------- 长期每日任务 ----------------
+# ---------------- 长期任务 ----------------
 
 class DailyTaskDialog(_FormDialog):
     def __init__(self, task: DailyTask | None = None, groups: list[str] | None = None,
                  parent=None, default_remind: int = DEFAULT_REMIND_MINUTES):
-        super().__init__("编辑长期每日任务" if task else "新建长期每日任务", parent)
+        super().__init__("编辑长期任务" if task else "新建长期任务", parent)
 
         self.title_edit = QLineEdit(task.title if task else "")
         self.title_edit.setPlaceholderText("任务名称，如：俯卧撑")

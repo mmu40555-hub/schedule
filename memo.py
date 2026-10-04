@@ -5,6 +5,8 @@
 - 允许简单重叠；与另一张重叠面积过大时松手，两张就叠成一摞
 - 叠起来后画布上只留一张，右侧一列小页签切换浏览，一摞最多五张
 - 页签右键能把某张移出这一摞，便签右键可以拆开整摞或删掉
+- 便签右键「合并成一整张…」可按页签序号把整摞并成一张：先弹出最终效果预览确认，
+  合并后各段之间垫一条分割线，分割线就是普通文字，想删随手删掉即可
 - 便签可以直接拖出主窗口：一出窗口边沿就当场变成桌面浮窗、一路跟手走；
   松手时压在哪个程序窗口上，就钉在哪个窗口上（浏览器、游戏启动器都行），
   底下要是光秃秃的桌面，那就只是浮在桌面最上层
@@ -21,6 +23,8 @@ from PyQt6.QtCore import QPoint, QRect, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QCursor, QFontMetrics, QPainter, QTextCursor
 from PyQt6.QtWidgets import (
     QApplication,
+    QDialog,
+    QDialogButtonBox,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -70,6 +74,9 @@ TAB_SPACING = 2
 STRIP_GAP = 6
 
 PLACEHOLDER = "点一下写点什么…"
+
+# 一摞便签合并成一整张时，正文之间的分割线；就是普通文字，合并后想删随手删掉
+MERGE_DIVIDER = "─" * 24
 
 # 便签盯着宿主窗口看的间隔；窗口一挪便签就跟上，靠的就是这个心跳
 HOST_TICK_MS = 60
@@ -275,6 +282,47 @@ def _preview(content: str, limit: int = 24) -> str:
     return text if len(text) <= limit else text[:limit] + "…"
 
 
+def _merge_texts(contents: list[str]) -> str:
+    """按顺序把几张便签的正文拼起来，中间垫一条分割线；空白的那几张跳过。"""
+    parts = [text.strip() for text in contents if text.strip()]
+    return f"\n\n{MERGE_DIVIDER}\n\n".join(parts)
+
+
+class _MergePreview(QDialog):
+    """合并前的最终效果预览：正文只读，点「确认合并」才真正并成一张。"""
+
+    def __init__(self, contents: list[str], merged: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("合并便签预览")
+        self.setMinimumSize(460, 360)
+
+        box = QVBoxLayout(self)
+        box.setContentsMargins(18, 16, 18, 16)
+        box.setSpacing(10)
+
+        tip = QLabel(
+            f"将按页签顺序把 {len(contents)} 张便签合并成一整张，"
+            f"中间用分割线隔开。合并后原来的几张会并进来，"
+            f"分割线就在正文里，想删随手删掉即可。"
+        )
+        tip.setObjectName("PageDate")
+        tip.setWordWrap(True)
+        box.addWidget(tip)
+
+        view = QTextEdit()
+        view.setObjectName("MergePreview")
+        view.setReadOnly(True)
+        view.setPlainText(merged)
+        box.addWidget(view, 1)
+
+        buttons = QDialogButtonBox()
+        cancel = buttons.addButton("取消", QDialogButtonBox.ButtonRole.RejectRole)
+        confirm = buttons.addButton("确认合并", QDialogButtonBox.ButtonRole.AcceptRole)
+        cancel.clicked.connect(self.reject)
+        confirm.clicked.connect(self.accept)
+        box.addWidget(buttons)
+
+
 def _overlap_ratio(a: QRect, b: QRect) -> float:
     """重叠面积占较小一张的比例：0 是没碰上，1 是完全盖住。"""
     overlap = a.intersected(b)
@@ -357,6 +405,7 @@ class StickyNote(QFrame):
     delete_requested = pyqtSignal(int)
     detach_requested = pyqtSignal(int)    # 从这一摞里拿出来
     split_requested = pyqtSignal(int)     # 拆开整摞
+    merge_requested = pyqtSignal(int)     # 按页签序号合并成一整张
 
     def __init__(self, memo: Memo, stack_size: int = 1, parent=None, desk: bool = False):
         super().__init__(parent)
@@ -807,6 +856,9 @@ class StickyNote(QFrame):
                 menu.addAction(
                     "拆开这一摞", lambda: self.split_requested.emit(self.memo.id)
                 )
+                menu.addAction(
+                    "合并成一整张…", lambda: self.merge_requested.emit(self.memo.stack_id)
+                )
         menu.addSeparator()
         menu.addAction("删除便签", lambda: self.delete_requested.emit(self.memo.id))
         menu.exec(event.globalPos())
@@ -840,6 +892,7 @@ class TabStrip(QWidget):
     selected = pyqtSignal(int, int)      # stack_id, memo_id
     detach_requested = pyqtSignal(int)   # memo_id
     split_requested = pyqtSignal(int)    # stack_id
+    merge_requested = pyqtSignal(int)    # stack_id
 
     def __init__(self, stack_id: int, members: list[Memo], active_id: int, parent=None):
         super().__init__(parent)
@@ -877,6 +930,7 @@ class TabStrip(QWidget):
         menu = QMenu(self)
         menu.addAction("从这摞里移出", lambda: self.detach_requested.emit(memo_id))
         menu.addAction("拆开这一摞", lambda: self.split_requested.emit(self.stack_id))
+        menu.addAction("合并成一整张…", lambda: self.merge_requested.emit(self.stack_id))
         menu.exec(button.mapToGlobal(pos))
 
 
@@ -981,6 +1035,7 @@ class MemoPage(QWidget):
             note.delete_requested.connect(self._on_delete)
             note.detach_requested.connect(self._detach)
             note.split_requested.connect(self._on_split)
+            note.merge_requested.connect(self._on_merge)
             note.show()
             self.notes.append(note)
             self.note_of[host.id] = note
@@ -990,6 +1045,7 @@ class MemoPage(QWidget):
                 strip.selected.connect(self._on_stack_selected)
                 strip.detach_requested.connect(self._detach)
                 strip.split_requested.connect(self._on_split)
+                strip.merge_requested.connect(self._on_merge)
                 strip.show()
                 self.strip_of[host.id] = strip
                 self._place_strip(note)
@@ -1409,6 +1465,19 @@ class MemoPage(QWidget):
                 memo.x + index * (NOTE_WIDTH + 16),
                 memo.y + index * 26,
             )
+        self.reload()
+
+    def _on_merge(self, stack_id: int) -> None:
+        """把一摞便签按页签序号合并成一整张：先给用户看一眼最终效果再落定。"""
+        members = self.store.stack_members(stack_id)
+        if len(members) < 2:
+            return
+        contents = [member.content for member in members]
+        merged = _merge_texts(contents)
+        if _MergePreview(contents, merged, self).exec() != QDialog.DialogCode.Accepted:
+            return
+        if self.store.merge_stack_into_one(stack_id, merged) is None:
+            return
         self.reload()
 
     def _on_delete(self, memo_id: int) -> None:
