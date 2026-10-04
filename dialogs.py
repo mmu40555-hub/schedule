@@ -591,13 +591,16 @@ class PeriodTaskDialog(_FormDialog):
 # ---------------- 主页设置 ----------------
 
 class SettingsDialog(_FormDialog):
-    """主页设置：默认提前提醒、提醒方式与音频、导航位置。"""
+    """主页设置：默认提前提醒、提醒方式与音频、导航位置、自动更新。"""
+
+    check_update_requested = pyqtSignal()   # 用户点了「检查更新…」
 
     def __init__(self, default_remind: int = DEFAULT_REMIND_MINUTES,
                  remind_mode: str = "", sound_enabled: bool = True,
                  sound_choice: str = "", sound_files: list[str] | None = None,
                  nav_position: str = NAV_TOP,
-                 new_note_hotkey: str = DEFAULT_NEW_NOTE_HOTKEY, parent=None):
+                 new_note_hotkey: str = DEFAULT_NEW_NOTE_HOTKEY,
+                 app_version: str = "", auto_update: bool = True, parent=None):
         super().__init__("设置", parent)
         self.setMinimumWidth(520)
 
@@ -665,6 +668,29 @@ class SettingsDialog(_FormDialog):
         self.hotkey_edit = HotkeyEdit(new_note_hotkey)
         self.form.addRow("便签快捷键", self.hotkey_edit)
 
+        self.auto_update_check = QCheckBox("启动时自动检查更新")
+        self.auto_update_check.setChecked(auto_update)
+        self.auto_update_check.setToolTip(
+            "每 24 小时最多查一次，发现新版本会先问过你，不会偷偷替换"
+        )
+        self.form.addRow("自动更新", self.auto_update_check)
+
+        version_label = QLabel(f"当前版本 v{app_version}" if app_version else "当前版本未知")
+        version_label.setObjectName("FieldHint")
+        check_button = QPushButton("检查更新…")
+        check_button.setObjectName("GhostButton")
+        check_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        check_button.setToolTip("现在就去 GitHub 看看有没有新版本")
+        check_button.clicked.connect(self.check_update_requested.emit)
+
+        version_row = QWidget()
+        version_layout = QHBoxLayout(version_row)
+        version_layout.setContentsMargins(0, 0, 0, 0)
+        version_layout.setSpacing(8)
+        version_layout.addWidget(version_label, 1)
+        version_layout.addWidget(check_button, 0)
+        self.form.addRow("版本", version_row)
+
         hint = QLabel(
             "默认提前提醒是新建有时限任务时提醒输入框的初始值，单条任务里仍可单独改；"
             "填 0 表示默认不提醒。\n"
@@ -672,7 +698,9 @@ class SettingsDialog(_FormDialog):
             "或点「添加音频…」挑一个文件，都能在下拉里选中。\n"
             "导航位置决定「今日一览 / 备忘录」的切换按钮摆在窗口顶部还是左侧。\n"
             "便签快捷键在任何程序里按下都管用：直接在鼠标位置开一张桌面便签。"
-            "点一下输入框再按一组键即可记录，按 Esc 清空表示不启用。"
+            "点一下输入框再按一组键即可记录，按 Esc 清空表示不启用。\n"
+            "自动更新只替换程序本身，日程数据与铃声都不会动；"
+            "关掉后就只在点「检查更新…」时去查。"
         )
         hint.setObjectName("FieldHint")
         hint.setWordWrap(True)
@@ -733,4 +761,5 @@ class SettingsDialog(_FormDialog):
             "sound_files": list(self.sound_files),
             "nav_position": self.nav_combo.currentData(),
             "new_note_hotkey": self.hotkey_edit.text().strip(),
+            "auto_update": self.auto_update_check.isChecked(),
         }

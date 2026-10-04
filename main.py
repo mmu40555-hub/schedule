@@ -39,6 +39,7 @@ from sound import ensure_sound_dir
 from storage import NAV_LEFT, Store
 from theme import APP_QSS, FONT_FAMILY
 from today_view import TodayView
+from updater import run_check, schedule_startup_check
 
 # 单实例用的本地套接字名，同一台机器上唯一
 SERVER_NAME = "schedule-single-instance"
@@ -275,12 +276,18 @@ class TrayIcon(QSystemTrayIcon):
         menu = QMenu()
         open_action = menu.addAction("打开主窗口")
         open_action.triggered.connect(window.bring_to_front)
+        update_action = menu.addAction("检查更新…")
+        update_action.triggered.connect(self._check_update)
         menu.addSeparator()
         quit_action = menu.addAction("退出程序")
         quit_action.triggered.connect(window.quit_app)
         self.setContextMenu(menu)
 
         self.activated.connect(self._on_activated)
+
+    def _check_update(self) -> None:
+        """托盘里手动查一次更新；结果会直接弹窗告知。"""
+        run_check(self.window_ref, self.window_ref.store, silent=False)
 
     def _on_activated(self, reason) -> None:
         if reason in (
@@ -360,6 +367,9 @@ def main() -> None:
         app.setQuitOnLastWindowClosed(False)
 
     window.show()
+
+    # 启动后悄悄看一眼有没有新版本（每 24 小时最多一次，可以在设置里关掉）
+    schedule_startup_check(window, store)
 
     exit_code = app.exec()
     store.close()

@@ -54,6 +54,7 @@ from storage import (
     Store,
 )
 from task_column import TaskColumn
+from updater import VERSION, run_check
 
 WEEKDAY = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 MAX_BANNER_NAMES = 3
@@ -237,7 +238,13 @@ class TodayView(QWidget):
             self.store.remind_sound_files(),
             self.store.nav_position(),
             self.store.new_note_hotkey(),
+            VERSION,
+            self.store.auto_update_check(),
             self,
+        )
+        # 设置窗还开着时点「检查更新…」：把更新提示挂在它上面，才盖得住这个模态窗
+        dialog.check_update_requested.connect(
+            lambda: run_check(dialog, self.store, silent=False)
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
@@ -249,6 +256,7 @@ class TodayView(QWidget):
         self.store.set_remind_sound_files(values["sound_files"])
         self.store.set_setting(SETTING_NAV_POSITION, str(values["nav_position"]))
         self.store.set_new_note_hotkey(values["new_note_hotkey"])
+        self.store.set_auto_update_check(values["auto_update"])
         self.settings_saved.emit()
 
     def _default_remind(self) -> int:

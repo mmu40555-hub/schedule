@@ -89,6 +89,11 @@ MAX_MEMO_STACK = 5
 SETTING_NEW_NOTE_HOTKEY = "new_note_hotkey"
 DEFAULT_NEW_NOTE_HOTKEY = "Ctrl+Alt+N"
 
+# 自动更新：开不开自动检查、上次检查的时间戳、用户说过要跳过的版本
+SETTING_AUTO_UPDATE = "auto_update_check"
+SETTING_UPDATE_LAST = "update_last_check"
+SETTING_UPDATE_SKIP = "update_skip_version"
+
 REMIND_AUTO = "auto"     # 有悬浮窗就在悬浮窗内提示，否则弹置底小窗
 REMIND_POPUP = "popup"   # 只用置底小窗
 REMIND_BOTH = "both"     # 两处都提示
@@ -1243,6 +1248,31 @@ class Store:
 
     def set_new_note_hotkey(self, shortcut: str) -> None:
         self.set_setting(SETTING_NEW_NOTE_HOTKEY, str(shortcut).strip())
+
+    def auto_update_check(self) -> bool:
+        """启动时要不要自动查一次新版本。默认开，只有明确存过 "0" 才关。"""
+        return self.get_setting(SETTING_AUTO_UPDATE, "1") != "0"
+
+    def set_auto_update_check(self, enabled: bool) -> None:
+        self.set_setting(SETTING_AUTO_UPDATE, "1" if enabled else "0")
+
+    def update_last_check(self) -> float:
+        """上次自动检查更新的时间戳；没查过返回 0。"""
+        raw = self.get_setting(SETTING_UPDATE_LAST, "")
+        try:
+            return float(raw)
+        except ValueError:
+            return 0.0
+
+    def set_update_last_check(self, stamp: float) -> None:
+        self.set_setting(SETTING_UPDATE_LAST, repr(float(stamp)))
+
+    def update_skip_version(self) -> str:
+        """用户选过「跳过这个版本」的版本号，空串表示没跳过谁。"""
+        return self.get_setting(SETTING_UPDATE_SKIP, "").strip()
+
+    def set_update_skip_version(self, version: str) -> None:
+        self.set_setting(SETTING_UPDATE_SKIP, str(version).strip())
 
     # ================= 到点提醒 =================
 
