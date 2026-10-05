@@ -7,10 +7,18 @@
 国内大部分网络连不上 GitHub，所以查询和下载都先直连、连不上再自动换镜像（见 MIRROR_PREFIXES）。
 镜像只是把原始 GitHub 地址接在前缀后面，附件内容仍按大小与 MZ 头核对，避免下到残缺或非程序的东西。
 
+更稳的办法是自建主源：把 exe 和一份 latest.json 放进对象存储（阿里云 OSS、腾讯云 COS 均可），
+国内直连稳定、完全可控。填好 PRIMARY_SOURCE 后先问主源，主源不可用再退回 GitHub 与镜像。
+latest.json 形如：
+    {"version": "0.2.2", "notes": "更新说明", "asset_name": "日程计划表.exe",
+     "asset_size": 38343151, "asset_url": "https://bucket.oss-cn-hangzhou.aliyuncs.com/schedule/日程计划表.exe"}
+其中 asset_url、asset_name、asset_size、notes 都可省略，asset_url 缺省时按 {主源}/v{版本}/{文件名} 拼。
+
 只换 exe 本身，程序目录里的 schedule.db 与「铃声」文件夹一概不碰。
 """
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -20,6 +28,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import quote
 
 from PyQt6.QtCore import QThread, Qt, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import QDesktopServices
@@ -58,6 +67,13 @@ CHECK_INTERVAL = 24 * 60 * 60
 # 下载分块大小与默认超时
 CHUNK = 64 * 1024
 TIMEOUT = 30.0
+
+# 主更新源：自建对象存储的目录地址（阿里云 OSS / 腾讯云 COS 等），末尾不要带斜杠。
+# 目录里放一份 latest.json（格式见文件头说明）和对应的 exe。
+# 留空表示不启用主源，行为跟以前一样只走 GitHub 与镜像；也可用环境变量临时覆盖。
+PRIMARY_SOURCE = os.environ.get("SCHEDULE_UPDATE_SOURCE", "").strip().rstrip("/")
+# 主源里描述最新版本的元数据文件名
+PRIMARY_META = "latest.json"
 
 # GitHub 加速镜像：国内连不上 GitHub 时自动改用它们。
 # 用法就是把原始 GitHub 地址整个接在前缀后面，例如
@@ -112,11 +128,14 @@ class UpdateInfo:
     """远端的一个新版本：版本号、更新说明，以及可下载的 exe 附件。"""
 
     version: str            # 去掉前缀 v 的版本号，如 0.1.5
-    notes: str              # Release 里的更新说明
+    notes: str              # 更新说明，来自 Release 或主源的 latest.json
     page_url: str           # 发布页，没挂 exe 时让用户去这里下
     asset_name: str = ""    # exe 附件文件名
     asset_url: str = ""     # exe 附件下载地址
     asset_size: int = 0     # 附件字节数，下载完用来核对
+    # 下载地址的候选序列（主源直链，或「GitHub 直连 + 各镜像」）；
+    # 为空时退回按 asset_url 现推。
+    asset_candidates: tuple = ()
 
 
 # ---------- 版本号 ----------
@@ -148,9 +167,17 @@ def target_exe() -> Path | None:
 
 # ---------- 网络 ----------
 
+def _encode_url(url: str) -> str:
+    """转义 URL 里的非 ASCII（例如中文文件名），urllib 只认 ASCII 地址。
+
+    safe 里留着 %，已经是 %XX 的部分不会再被二次编码。
+    """
+    return quote(url, safe=":/?#[]@!$&'()*+,;=%")
+
+
 def _read_json(url: str, timeout: float) -> dict:
     """GET 一个 JSON 接口并解析；出错直接抛给调用方。"""
-    request = urllib.request.Request(url, headers=HEADERS)
+    request = urllib.request.Request(_encode_url(url), headers=HEADERS)
     with urllib.request.urlopen(request, timeout=timeout) as response:
         return json.load(response)
 
@@ -177,11 +204,46 @@ def _fetch_release(timeout: float) -> dict | None:
     raise direct_error
 
 
+def _from_primary(timeout: float) -> UpdateInfo | None:
+    """从自建主源读 latest.json；没配主源就返回 None。
+
+    主源是我们自己放的对象存储，返回的直链直接就能下，不必再套 GitHub 镜像。
+    """
+    if not PRIMARY_SOURCE:
+        return None
+    data = _read_json(f"{PRIMARY_SOURCE}/{PRIMARY_META}", timeout)
+    version = str(data.get("version") or "").lstrip("vV")
+    if not version:
+        return None
+    name = str(data.get("asset_name") or f"{APP_NAME}.exe")
+    url = str(data.get("asset_url") or f"{PRIMARY_SOURCE}/v{version}/{name}")
+    return UpdateInfo(
+        version=version,
+        notes=str(data.get("notes") or ""),
+        page_url=str(data.get("page_url") or RELEASE_PAGE),
+        asset_name=name,
+        asset_url=url,
+        asset_size=int(data.get("asset_size") or 0),
+        asset_candidates=(url,),
+    )
+
+
 def fetch_latest(timeout: float = TIMEOUT) -> UpdateInfo | None:
-    """取最新发布；仓库还没发过 Release 时返回 None。
+    """取最新发布；仓库还没发过 Release 且主源也没消息时返回 None。
+
+    先问主源：主源给出版本且确实比当前新，就直接用它，省得再去连 GitHub。
+    主源没配、连不上、或版本不比当前新（可能没同步），都照旧走 GitHub 与镜像。
 
     网络或接口出错会抛异常，由调用方决定是静默跳过还是提示用户。
     """
+    if PRIMARY_SOURCE:
+        try:
+            primary = _from_primary(timeout)
+        except Exception:            # noqa: BLE001 主源挂了就当它没有，退回 GitHub
+            primary = None
+        if primary is not None and is_newer(primary.version):
+            return primary
+
     data = _fetch_release(timeout)
     if data is None:
         return None
@@ -207,7 +269,7 @@ def fetch_latest(timeout: float = TIMEOUT) -> UpdateInfo | None:
 
 def _download_once(url: str, dest: Path, on_progress, cancel, timeout: float) -> bool:
     """从一个具体地址下载，返回 False 表示中途被取消。"""
-    request = urllib.request.Request(url, headers=HEADERS)
+    request = urllib.request.Request(_encode_url(url), headers=HEADERS)
     with urllib.request.urlopen(request, timeout=timeout) as response:
         total = int(response.headers.get("Content-Length") or 0)
         done = 0
@@ -225,15 +287,17 @@ def _download_once(url: str, dest: Path, on_progress, cancel, timeout: float) ->
     return True
 
 
-def download_asset(url: str, dest: Path, on_progress=None, cancel=None,
+def download_asset(url, dest: Path, on_progress=None, cancel=None,
                    timeout: float = TIMEOUT) -> bool:
     """把附件下到 dest；on_progress(已下载, 总大小) 用来刷进度条。
 
-    先直连 GitHub，中途连不上或断流就换下一个镜像重下。
+    url 可以是单个地址，也可以是已经排好序的候选列表：单个 GitHub 地址会展开成
+    「直连 + 各镜像」逐个试；主源（对象存储）给的候选列表按原样用，不套 GitHub 镜像。
     返回 False 表示中途被用户取消。
     """
+    candidates = mirror_candidates(url) if isinstance(url, str) else list(url)
     last_error = None
-    for candidate in mirror_candidates(url):
+    for candidate in candidates:
         if cancel is not None and cancel():
             return False
         try:
@@ -314,9 +378,9 @@ class DownloadThread(QThread):
     failed = pyqtSignal(str)
     done = pyqtSignal(str)
 
-    def __init__(self, url: str, dest: Path, expected_size: int = 0):
+    def __init__(self, url, dest: Path, expected_size: int = 0):
         super().__init__()
-        self._url = url
+        self._url = url                  # 单个地址或候选列表，见 download_asset
         self._dest = dest
         self._expected = expected_size
         self._cancelled = False
@@ -472,7 +536,7 @@ def _apply(parent, store, info: UpdateInfo) -> None:
     dest = folder / (info.asset_name or target.name)
 
     dialog = DownloadDialog(info.version, parent)
-    thread = DownloadThread(info.asset_url, dest, info.asset_size)
+    thread = DownloadThread(info.asset_candidates or info.asset_url, dest, info.asset_size)
     _keep(thread)
 
     def on_progress(done: int, total: int) -> None:
@@ -518,7 +582,7 @@ def run_check(parent, store, silent: bool = False) -> None:
     def on_failed(message: str) -> None:
         if not silent:
             QMessageBox.warning(
-                parent, "检查更新失败", f"没能连上 GitHub：\n{message}"
+                parent, "检查更新失败", f"没能连上更新源：\n{message}"
             )
 
     def on_done(info) -> None:
