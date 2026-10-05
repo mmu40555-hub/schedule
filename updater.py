@@ -4,6 +4,9 @@
 `日程计划表.exe`。程序启动后静默查一次（每 24 小时最多一次），发现新版就弹窗问一句，
 用户点了「立即更新」才下载；下载完生成一个临时批处理，等本进程退出后把旧 exe 换掉并重启。
 
+国内大部分网络连不上 GitHub，所以查询和下载都先直连、连不上再自动换镜像（见 MIRROR_PREFIXES）。
+镜像只是把原始 GitHub 地址接在前缀后面，附件内容仍按大小与 MZ 头核对，避免下到残缺或非程序的东西。
+
 只换 exe 本身，程序目录里的 schedule.db 与「铃声」文件夹一概不碰。
 """
 
@@ -55,6 +58,25 @@ CHECK_INTERVAL = 24 * 60 * 60
 # 下载分块大小与默认超时
 CHUNK = 64 * 1024
 TIMEOUT = 30.0
+
+# GitHub 加速镜像：国内连不上 GitHub 时自动改用它们。
+# 用法就是把原始 GitHub 地址整个接在前缀后面，例如
+#   https://gh-proxy.com/https://api.github.com/repos/...
+# 顺序按可用性排：gh-proxy 同时支持 Release 附件与 REST API，其余主要兜底下载。
+MIRROR_PREFIXES = (
+    "https://gh-proxy.com/",
+    "https://gh-proxy.org/",
+    "https://ghproxy.net/",
+    "https://ghfast.top/",
+    "https://gh.ddlc.top/",
+    "https://github.boki.moe/",
+)
+
+
+def mirror_candidates(url: str) -> list[str]:
+    """直连地址排第一，后面依次是各镜像拼出来的地址。"""
+    return [url, *(prefix + url for prefix in MIRROR_PREFIXES)]
+
 
 # 替换脚本里最多重试多少次（每次间隔约 1 秒），等旧进程放开 exe
 REPLACE_TRIES = 90
@@ -126,19 +148,43 @@ def target_exe() -> Path | None:
 
 # ---------- 网络 ----------
 
+def _read_json(url: str, timeout: float) -> dict:
+    """GET 一个 JSON 接口并解析；出错直接抛给调用方。"""
+    request = urllib.request.Request(url, headers=HEADERS)
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.load(response)
+
+
+def _fetch_release(timeout: float) -> dict | None:
+    """取最新发布的数据：先直连 GitHub，不通再逐个试镜像。
+
+    直连返回 404 是权威结果——仓库确实没发过 Release，此时不该再折腾镜像。
+    """
+    try:
+        return _read_json(API_LATEST, timeout)
+    except urllib.error.HTTPError as error:
+        if error.code == 404:
+            return None
+        direct_error = error
+    except Exception as error:            # noqa: BLE001 直连失败的花样很多
+        direct_error = error
+
+    for prefix in MIRROR_PREFIXES:
+        try:
+            return _read_json(prefix + API_LATEST, timeout)
+        except Exception:                 # noqa: BLE001 镜像不支持 API 也算失败，换下一个
+            continue
+    raise direct_error
+
+
 def fetch_latest(timeout: float = TIMEOUT) -> UpdateInfo | None:
     """取最新发布；仓库还没发过 Release 时返回 None。
 
     网络或接口出错会抛异常，由调用方决定是静默跳过还是提示用户。
     """
-    request = urllib.request.Request(API_LATEST, headers=HEADERS)
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            data = json.load(response)
-    except urllib.error.HTTPError as error:
-        if error.code == 404:
-            return None      # 还没有任何 Release
-        raise
+    data = _fetch_release(timeout)
+    if data is None:
+        return None
 
     tag = str(data.get("tag_name") or "")
     if not tag:
@@ -159,12 +205,8 @@ def fetch_latest(timeout: float = TIMEOUT) -> UpdateInfo | None:
     )
 
 
-def download_asset(url: str, dest: Path, on_progress=None, cancel=None,
-                   timeout: float = TIMEOUT) -> bool:
-    """把附件下到 dest；on_progress(已下载, 总大小) 用来刷进度条。
-
-    返回 False 表示中途被取消。
-    """
+def _download_once(url: str, dest: Path, on_progress, cancel, timeout: float) -> bool:
+    """从一个具体地址下载，返回 False 表示中途被取消。"""
     request = urllib.request.Request(url, headers=HEADERS)
     with urllib.request.urlopen(request, timeout=timeout) as response:
         total = int(response.headers.get("Content-Length") or 0)
@@ -181,6 +223,24 @@ def download_asset(url: str, dest: Path, on_progress=None, cancel=None,
                 if on_progress is not None:
                     on_progress(done, total)
     return True
+
+
+def download_asset(url: str, dest: Path, on_progress=None, cancel=None,
+                   timeout: float = TIMEOUT) -> bool:
+    """把附件下到 dest；on_progress(已下载, 总大小) 用来刷进度条。
+
+    先直连 GitHub，中途连不上或断流就换下一个镜像重下。
+    返回 False 表示中途被用户取消。
+    """
+    last_error = None
+    for candidate in mirror_candidates(url):
+        if cancel is not None and cancel():
+            return False
+        try:
+            return _download_once(candidate, dest, on_progress, cancel, timeout)
+        except Exception as error:        # noqa: BLE001 超时、断流、证书错误都算，换镜像
+            last_error = error
+    raise last_error
 
 
 def verify_asset(path: Path, expected_size: int = 0) -> str:
