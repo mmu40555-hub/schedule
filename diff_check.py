@@ -25,15 +25,24 @@ FROZEN_STAMP = "2026-03-15 09:00:00"
 
 
 def _freeze(storage) -> None:
-    """把 storage 里跟「现在」有关的两处钉死，否则两次运行差几秒就对不上。"""
+    """把 storage 里跟「现在」有关的东西钉死，否则两次运行差几秒就对不上。
+
+    storage 眼下是单个文件；将来拆成包以后，date 与 _stamp 会散到各个子模块里，
+    所以这里按名字把 storage 名下的每个模块都铺一遍，拆不拆都照样管用。
+    """
 
     class FrozenDate(date):
         @classmethod
         def today(cls):
             return cls(FROZEN_DAY.year, FROZEN_DAY.month, FROZEN_DAY.day)
 
-    storage.date = FrozenDate
-    storage._stamp = lambda: FROZEN_STAMP
+    for name, module in list(sys.modules.items()):
+        if name != "storage" and not name.startswith("storage."):
+            continue
+        if getattr(module, "_stamp", None) is not None:
+            module._stamp = lambda: FROZEN_STAMP
+        if getattr(module, "date", None) is date:
+            module.date = FrozenDate
 
 
 def _run_operations(store, storage) -> None:
