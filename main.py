@@ -7,6 +7,7 @@
        要真正结束得从托盘图标右键菜单里选「退出程序」
 """
 
+import os
 import sys
 
 from PyQt6.QtCore import QEvent, QRectF, Qt
@@ -43,8 +44,13 @@ from today_view import TodayView
 from trash_view import TrashView
 from updater import run_check, schedule_startup_check
 
-# 单实例用的本地套接字名，同一台机器上唯一
-SERVER_NAME = "schedule-single-instance"
+# 单实例用的本地套接字名，同一台机器上唯一。
+# 环境变量可以让第二份工作副本换一个名字，方便两版并行开着做对比。
+SERVER_NAME = os.environ.get("SCHEDULE_INSTANCE_NAME", "schedule-single-instance")
+
+# 测试模式：同一台机器上同时跑两份程序时，全局热键和自动更新会互相打架，
+# 设了这个环境变量就让它们让路。平时不设，行为跟原来完全一样。
+TEST_MODE = bool(os.environ.get("SCHEDULE_TEST_MODE"))
 
 # 图标主色跟界面保持一致
 ICON_BLUE = "#2F80ED"
@@ -216,6 +222,8 @@ class MainWindow(QMainWindow):
 
     def apply_hotkey(self) -> None:
         """按设置里的组合键重新注册；注册不上就通过托盘说一声。"""
+        if TEST_MODE:
+            return
         shortcut = self.store.new_note_hotkey()
         if not shortcut:
             self.hotkey.unregister()
@@ -384,7 +392,8 @@ def main() -> None:
     window.show()
 
     # 启动后悄悄看一眼有没有新版本（每 24 小时最多一次，可以在设置里关掉）
-    schedule_startup_check(window, store)
+    if not TEST_MODE:
+        schedule_startup_check(window, store)
 
     exit_code = app.exec()
     store.close()
