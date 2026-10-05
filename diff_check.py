@@ -154,6 +154,9 @@ def _snapshot(store, storage) -> dict:
         ).fetchall()
     ]
     snapshot = {
+        # 数据文件必须落在程序目录里。拆包很容易把 _app_dir() 指到子目录去，
+        # 而下面的快照都是显式传库路径的，抓不到这种偏差，所以单独盯一眼。
+        "db_path_ok": storage.DB_PATH.parent == Path(__file__).resolve().parent,
         "schema": [
             row["sql"]
             for row in conn.execute(
