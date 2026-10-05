@@ -34,11 +34,13 @@ from PyQt6.QtWidgets import (
 )
 
 from hotkey import GlobalHotkey
+from history_view import HistoryView
 from memo import MemoPage
 from sound import ensure_sound_dir
 from storage import NAV_LEFT, Store
 from theme import APP_QSS, FONT_FAMILY
 from today_view import TodayView
+from trash_view import TrashView
 from updater import run_check, schedule_startup_check
 
 # 单实例用的本地套接字名，同一台机器上唯一
@@ -88,8 +90,13 @@ def _app_icon() -> QIcon:
 
 
 class MainWindow(QMainWindow):
-    # 主导航上的两页：键、按钮文字
-    PAGES = (("today", "今日一览"), ("memo", "备忘录"))
+    # 主导航上的几页：键、按钮文字
+    PAGES = (
+        ("today", "今日一览"),
+        ("memo", "备忘录"),
+        ("history", "历史汇总"),
+        ("trash", "废弃栏"),
+    )
 
     def __init__(self, store: Store):
         super().__init__()
@@ -104,10 +111,14 @@ class MainWindow(QMainWindow):
 
         self.today_view = TodayView(store)
         self.memo_view = MemoPage(store)
+        self.history_view = HistoryView(store)
+        self.trash_view = TrashView(store)
 
         self.stack = QStackedWidget()
         self.stack.addWidget(self.today_view)
         self.stack.addWidget(self.memo_view)
+        self.stack.addWidget(self.history_view)
+        self.stack.addWidget(self.trash_view)
 
         self._page = "today"
         self._nav_position = store.nav_position()
@@ -174,9 +185,13 @@ class MainWindow(QMainWindow):
         index = [page for page, _ in self.PAGES].index(key)
         self.stack.setCurrentIndex(index)
         self._page = key
+        # 别处可能动过数据，切进来时按库里的现状重铺一遍
         if key == "memo":
-            # 别处可能动过便签，切进来时按库里的数据重铺一遍
             self.memo_view.reload()
+        elif key == "history":
+            self.history_view.reload()
+        elif key == "trash":
+            self.trash_view.reload()
         self._refresh_nav()
 
     def _refresh_nav(self) -> None:

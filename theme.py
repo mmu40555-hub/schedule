@@ -760,4 +760,133 @@ QTextEdit#StickyEdit {{
     font-weight: 600;
     color: #FFFFFF;
 }}
+
+/* ---------- 历史汇总 ---------- */
+
+#HistoryPage, #TrashPage {{
+    background: {BG};
+}}
+
+#HistoryScroll, #TrashBarScroll, #TrashContentScroll {{
+    background: transparent;
+    border: none;
+}}
+
+#SearchBox {{
+    background: {SURFACE};
+    border: 1px solid {BORDER};
+    border-radius: 8px;
+    padding: 7px 12px;
+    font-size: 13px;
+}}
+
+#SearchBox:focus {{
+    border-color: #2F80ED;
+}}
+
+#HistoryEntry {{
+    background: {SURFACE};
+    border: 1px solid {BORDER};
+    border-radius: 9px;
+}}
+
+#HistoryEntry:hover {{
+    border-color: {BORDER_STRONG};
+}}
+
+#EntryChip {{
+    font-weight: 600;
+}}
+
+#EntryTitle {{
+    font-size: 14px;
+    font-weight: 600;
+    color: {TEXT_PRIMARY};
+}}
+
+#EntryTime {{
+    font-size: 12px;
+    color: {TEXT_MUTED};
+}}
+
+#EntryMeta {{
+    font-size: 12px;
+    color: {TEXT_SECONDARY};
+}}
+
+#EmptyHint {{
+    color: {TEXT_MUTED};
+    font-size: 13px;
+    padding: 40px 0;
+}}
+
+/* ---------- 废弃栏 ---------- */
+
+#TrashBar {{
+    background: {SURFACE};
+    border: 1px solid {BORDER};
+    border-radius: 9px;
+}}
+
+#SubPageItem {{
+    background: {SURFACE};
+    border: 1px solid {BORDER};
+    border-radius: 7px;
+}}
+
+#SubPageItem:hover {{
+    background: #EDF0F3;
+}}
+
+#SubPageItemOn {{
+    background: {rgba("#2F80ED", 0.10)};
+    border: 1px solid #2F80ED;
+    border-radius: 7px;
+}}
+
+#SubPageTitle {{
+    font-size: 13px;
+    color: {TEXT_PRIMARY};
+}}
+
+#SubPageTime {{
+    font-size: 11px;
+    color: {TEXT_MUTED};
+}}
+
+#TrashCard {{
+    background: {SURFACE};
+    border: 1px solid {BORDER};
+    border-radius: 9px;
+}}
+
+#TrashCardTitle {{
+    font-size: 14px;
+    font-weight: 600;
+    color: {TEXT_PRIMARY};
+}}
+
+#TrashCardBody {{
+    font-size: 13px;
+    color: {TEXT_PRIMARY};
+    line-height: 150%;
+}}
+
+#DangerButton {{
+    background: transparent;
+    border: 1px solid {rgba("#E5484D", 0.5)};
+    border-radius: 7px;
+    padding: 6px 14px;
+    font-size: 13px;
+    color: #E5484D;
+}}
+
+#DangerButton:hover {{
+    background: {rgba("#E5484D", 0.10)};
+}}
+
+#DangerButton:disabled {{
+    border-color: {BORDER};
+    color: {TEXT_DONE};
+}}
 """

@@ -402,7 +402,7 @@ class StickyNote(QFrame):
     host_changed = pyqtSignal(int)             # 贴上了 / 摘下了宿主窗口
     host_lost = pyqtSignal(int)                # 宿主窗口没了，请把它收回页面
     pick_requested = pyqtSignal(int)           # 右键选了「钉到某个窗口…」
-    delete_requested = pyqtSignal(int)
+    discard_requested = pyqtSignal(int)   # 丢进「废弃栏」
     detach_requested = pyqtSignal(int)    # 从这一摞里拿出来
     split_requested = pyqtSignal(int)     # 拆开整摞
     merge_requested = pyqtSignal(int)     # 按页签序号合并成一整张
@@ -860,7 +860,10 @@ class StickyNote(QFrame):
                     "合并成一整张…", lambda: self.merge_requested.emit(self.memo.stack_id)
                 )
         menu.addSeparator()
-        menu.addAction("删除便签", lambda: self.delete_requested.emit(self.memo.id))
+        discard = menu.addAction(
+            "丢弃便签", lambda: self.discard_requested.emit(self.memo.id)
+        )
+        discard.setToolTip("从备忘录里收进「废弃栏」，内容留着随时能找回")
         menu.exec(event.globalPos())
 
 
@@ -1032,7 +1035,7 @@ class MemoPage(QWidget):
             note.create_requested.connect(lambda memo_id=host.id: self._create_beside(memo_id))
             note.pin_requested.connect(self._on_pin)
             note.dragged_out.connect(self._on_dragged_out)
-            note.delete_requested.connect(self._on_delete)
+            note.discard_requested.connect(self._on_discard)
             note.detach_requested.connect(self._detach)
             note.split_requested.connect(self._on_split)
             note.merge_requested.connect(self._on_merge)
@@ -1097,7 +1100,7 @@ class MemoPage(QWidget):
         note.host_changed.connect(self._on_host_changed)
         note.host_lost.connect(self._on_host_lost)
         note.pick_requested.connect(self._begin_pick)
-        note.delete_requested.connect(self._on_delete)
+        note.discard_requested.connect(self._on_discard)
         self.desk[memo.id] = note
         if self._desk_hidden:
             note.park()
@@ -1480,16 +1483,18 @@ class MemoPage(QWidget):
             return
         self.reload()
 
-    def _on_delete(self, memo_id: int) -> None:
+    def _on_discard(self, memo_id: int) -> None:
+        """把便签丢进「废弃栏」：从备忘录收起来，内容留着随时能翻回来。"""
         memo = self.store.get_memo(memo_id)
         if memo is None:
             return
         confirmed = QMessageBox.question(
             self,
-            "删除便签",
-            f"确定删除这张便签吗？\n\n{_preview(memo.content, 40)}",
+            "丢弃便签",
+            f"丢弃后这张便签就从备忘录收起来了，可以随时到「废弃栏」页面找回。\n\n"
+            f"{_preview(memo.content, 40)}",
         )
         if confirmed != QMessageBox.StandardButton.Yes:
             return
-        self.store.delete_memo(memo_id)
+        self.store.discard_memo(memo_id)
         self.reload()

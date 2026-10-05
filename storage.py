@@ -137,7 +137,8 @@ CREATE TABLE IF NOT EXISTS once_tasks (
     note       TEXT    NOT NULL DEFAULT '',
     status     TEXT    NOT NULL DEFAULT 'pending',
     always_show INTEGER NOT NULL DEFAULT 0,
-    sort_order INTEGER NOT NULL DEFAULT 0
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    done_at    TEXT    NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS period_tasks (
@@ -147,7 +148,8 @@ CREATE TABLE IF NOT EXISTS period_tasks (
     deadline   TEXT    NOT NULL,
     note       TEXT    NOT NULL DEFAULT '',
     archived   INTEGER NOT NULL DEFAULT 0,
-    sort_order INTEGER NOT NULL DEFAULT 0
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    done_at    TEXT    NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS period_stages (
@@ -202,7 +204,8 @@ CREATE TABLE IF NOT EXISTS memos (
     host_title  TEXT    NOT NULL DEFAULT '',
     host_dx     INTEGER NOT NULL DEFAULT 0,
     host_dy     INTEGER NOT NULL DEFAULT 0,
-    updated_day TEXT    NOT NULL DEFAULT ''
+    updated_day TEXT    NOT NULL DEFAULT '',
+    discarded_at TEXT   NOT NULL DEFAULT ''
 );
 """
 
@@ -237,6 +240,7 @@ class OnceTask:
     sort_order: int = 0
     group_name: str = ""
     remind_minutes: int = DEFAULT_REMIND_MINUTES   # 到点前几分钟提醒
+    done_at: str = ""             # 完成时刻，形如 2026-07-07 15:04:05；没完成是空串
 
 
 @dataclass
@@ -248,6 +252,7 @@ class PeriodTask:
     archived: bool = False
     sort_order: int = 0
     group_name: str = ""
+    done_at: str = ""             # 所有阶段做完才算完成，记下那一刻
 
 
 @dataclass
@@ -279,6 +284,27 @@ class Reminder:
 
 
 @dataclass
+class HistoryEntry:
+    """历史汇总里的一条：一个完成过的任务。
+
+    长期每日任务不进历史，所以这里只有临时任务与时期任务。
+    """
+
+    key: str            # 与今日一览一致的 item_key
+    title: str
+    source: str
+    group: str = ""
+    note: str = ""
+    done_at: str = ""   # 完成时刻；老数据没这个字段，为空
+    plan: str = ""      # 任务的计划日期 / 最终期限，完成时刻缺失时拿它排序
+
+    @property
+    def sort_key(self) -> str:
+        """排序用的时间：优先真实的完成时刻，老数据退回计划日期。"""
+        return self.done_at or self.plan
+
+
+@dataclass
 class Memo:
     """一张便签：位置自由，内容即文本，同摞的共享一个 stack_id。"""
 
@@ -297,6 +323,7 @@ class Memo:
     host_dx: int = 0
     host_dy: int = 0
     updated_day: str = ""
+    discarded_at: str = ""   # 丢弃时刻；非空表示躺在「废弃栏」里，不再出现在备忘录页面
 
 
 def _memo(row: sqlite3.Row) -> Memo:
@@ -314,6 +341,7 @@ def _memo(row: sqlite3.Row) -> Memo:
         host_dx=row["host_dx"],
         host_dy=row["host_dy"],
         updated_day=row["updated_day"],
+        discarded_at=row["discarded_at"],
     )
 
 
@@ -346,6 +374,7 @@ def _once(row: sqlite3.Row) -> OnceTask:
         sort_order=row["sort_order"],
         group_name=row["group_name"],
         remind_minutes=row["remind_minutes"],
+        done_at=row["done_at"],
     )
 
 
@@ -358,6 +387,7 @@ def _period(row: sqlite3.Row) -> PeriodTask:
         archived=bool(row["archived"]),
         sort_order=row["sort_order"],
         group_name=row["group_name"],
+        done_at=row["done_at"],
     )
 
 
@@ -406,6 +436,10 @@ class Store:
         # 每日任务后来支持了每周 / 每月周期
         self._add_column("daily_tasks", "repeat", "TEXT NOT NULL DEFAULT 'daily'")
         self._add_column("daily_tasks", "repeat_day", "INTEGER NOT NULL DEFAULT 0")
+        # 历史汇总要知道「什么时候完成的」，废弃栏要知道「什么时候丢的」
+        self._add_column("once_tasks", "done_at", "TEXT NOT NULL DEFAULT ''")
+        self._add_column("period_tasks", "done_at", "TEXT NOT NULL DEFAULT ''")
+        self._add_column("memos", "discarded_at", "TEXT NOT NULL DEFAULT ''")
 
         # 组别早期只服务于每日任务，表名 daily_groups，现在三类任务共用
         tables = {
@@ -919,8 +953,8 @@ class Store:
 
         elif kind == SOURCE_ONCE:
             self.conn.execute(
-                "UPDATE once_tasks SET status=? WHERE id=?",
-                ("done" if done else "pending", int(rest)),
+                "UPDATE once_tasks SET status=?, done_at=? WHERE id=?",
+                ("done" if done else "pending", _stamp() if done else "", int(rest)),
             )
             self.conn.commit()
 
@@ -940,6 +974,33 @@ class Store:
                         "UPDATE period_stages SET done=0 WHERE id=?", (done_stages[-1].id,)
                     )
             self.conn.commit()
+            self._sync_period_done(task_id)
+
+    def _sync_period_done(self, task_id: int) -> None:
+        """时期任务的完成与否看阶段：全做完就归档并记下完成时刻，退回一步就复活。
+
+        完成时刻只在第一次完成时写下，之后来回勾不会把历史里的时间改来改去。
+        """
+        stages = self.list_stages(task_id)
+        complete = all(stage.done for stage in stages)
+        row = self.conn.execute(
+            "SELECT done_at FROM period_tasks WHERE id=?", (int(task_id),)
+        ).fetchone()
+        if row is None:
+            return
+        if complete:
+            if not row["done_at"]:
+                self.conn.execute(
+                    "UPDATE period_tasks SET archived=1, done_at=? WHERE id=?",
+                    (_stamp(), int(task_id)),
+                )
+        else:
+            # 退回阶段后任务重新变成未完成，得让它回到今日一览，也别留在历史里
+            self.conn.execute(
+                "UPDATE period_tasks SET archived=0, done_at='' WHERE id=?",
+                (int(task_id),),
+            )
+        self.conn.commit()
 
     def dismiss_item(self, key: str, kind: str = KIND_BACKLOG) -> None:
         """kind 区分「不再提醒的横幅」与「不再保留的积压项」，两者互不影响。"""
@@ -958,9 +1019,12 @@ class Store:
     # ================= 备忘录便签 =================
 
     def list_memos(self) -> list[Memo]:
-        """全部便签：按摞聚合，摞内按页签序号排。"""
+        """备忘录页面上的全部便签：按摞聚合，摞内按页签序号排。
+
+        丢进「废弃栏」的不在此列。
+        """
         rows = self.conn.execute(
-            "SELECT * FROM memos ORDER BY stack_id, stack_order, id"
+            "SELECT * FROM memos WHERE discarded_at='' ORDER BY stack_id, stack_order, id"
         ).fetchall()
         return [_memo(r) for r in rows]
 
@@ -1047,6 +1111,43 @@ class Store:
         if stack_id:
             self._settle_stack(stack_id)
         self.conn.commit()
+
+    # ---------- 废弃栏 ----------
+
+    def discard_memo(self, memo_id: int) -> None:
+        """把便签丢进废弃栏：内容留着，只是从备忘录页面收起来。"""
+        self.conn.execute(
+            "UPDATE memos SET discarded_at=?, pinned=0 WHERE id=?",
+            (_stamp(), int(memo_id)),
+        )
+        self.conn.commit()
+
+    def list_discarded_memos(self) -> list[Memo]:
+        """废弃栏里的便签：按丢弃时间排，最近丢的排最前。"""
+        rows = self.conn.execute(
+            "SELECT * FROM memos WHERE discarded_at!=''"
+            " ORDER BY discarded_at DESC, id DESC"
+        ).fetchall()
+        return [_memo(r) for r in rows]
+
+    def restore_memo(self, memo_id: int) -> None:
+        """把便签从废弃栏捞回备忘录页面。"""
+        self.conn.execute(
+            "UPDATE memos SET discarded_at='' WHERE id=?", (int(memo_id),)
+        )
+        self.conn.commit()
+
+    def purge_memos(self, memo_ids: list[int]) -> int:
+        """彻底删除：从废弃栏里删掉就真没了，返回删掉的张数。"""
+        ids = [int(item) for item in memo_ids]
+        if not ids:
+            return 0
+        marks = ",".join("?" for _ in ids)
+        cursor = self.conn.execute(
+            f"DELETE FROM memos WHERE id IN ({marks}) AND discarded_at!=''", ids
+        )
+        self.conn.commit()
+        return int(cursor.rowcount)
 
     def stack_members(self, stack_id: int) -> list[Memo]:
         """某一摞里的便签，按页签序号排（序号由 stack_order 固定下来）。"""
@@ -1402,6 +1503,44 @@ class Store:
         )
         self.conn.commit()
 
+    # ================= 历史汇总 =================
+
+    def completed_history(self) -> list[HistoryEntry]:
+        """完成过的任务，按时间倒序（最近完成的排最前）。
+
+        长期每日任务不进这里；时期任务要所有阶段都做完才算完成。
+        老数据的完成时刻是空的，那时就退回任务自己的日期 / 期限参与排序。
+        """
+        entries: list[HistoryEntry] = []
+        for row in self.conn.execute(
+            "SELECT id, title, group_name, note, day AS plan, done_at"
+            " FROM once_tasks WHERE status='done'"
+        ).fetchall():
+            entries.append(HistoryEntry(
+                key=f"{SOURCE_ONCE}:{row['id']}",
+                title=row["title"],
+                source=SOURCE_ONCE,
+                group=row["group_name"],
+                note=row["note"],
+                done_at=row["done_at"],
+                plan=row["plan"],
+            ))
+        for row in self.conn.execute(
+            "SELECT id, title, group_name, note, deadline AS plan, done_at"
+            " FROM period_tasks WHERE archived=1"
+        ).fetchall():
+            entries.append(HistoryEntry(
+                key=f"{SOURCE_PERIOD}:{row['id']}",
+                title=row["title"],
+                source=SOURCE_PERIOD,
+                group=row["group_name"],
+                note=row["note"],
+                done_at=row["done_at"],
+                plan=row["plan"],
+            ))
+        entries.sort(key=lambda item: item.sort_key, reverse=True)
+        return entries
+
     def discarded_once_tasks(self) -> list[OnceTask]:
         """被弃置、且用户还没处理过的临时任务，用于首页横幅提醒。"""
         rows = self.conn.execute(
@@ -1416,8 +1555,8 @@ class Store:
         return result
 
     def _archive_period_task(self, task_id: int) -> None:
-        self.conn.execute("UPDATE period_tasks SET archived=1 WHERE id=?", (task_id,))
-        self.conn.commit()
+        """推导今日一览时发现阶段都做完了：归档并补上完成时刻。"""
+        self._sync_period_done(task_id)
 
     def _next_order(self, table: str) -> int:
         row = self.conn.execute(f"SELECT COALESCE(MAX(sort_order), 0) + 1 FROM {table}").fetchone()
@@ -1517,6 +1656,11 @@ def _clean_repeat(repeat: str) -> str:
     if repeat in (REPEAT_DAILY, REPEAT_WEEKLY, REPEAT_MONTHLY):
         return repeat
     return REPEAT_DAILY
+
+
+def _stamp() -> str:
+    """当前时刻，形如 2026-07-07 15:04:05；完成时间与丢弃时间都用它。"""
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _month_day(day: date, repeat_day: int) -> int:
