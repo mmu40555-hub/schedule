@@ -32,9 +32,9 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
 )
 
-# 程序名与版本号：发版时和 git tag 一起改，tag 形如 v0.1.6
+# 程序名与版本号：发版时和 git tag 一起改，tag 形如 v0.2.1
 APP_NAME = "日程计划表"
-VERSION = "0.1.6"
+VERSION = "0.2.1"
 
 # 更新源仓库与发布页面
 REPO = "mmu40555-hub/schedule"
