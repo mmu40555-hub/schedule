@@ -10,7 +10,8 @@ def _app_dir() -> Path:
     """打包成 exe 后 __file__ 指向临时解包目录，数据文件要落在 exe 旁边。"""
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent
+    # 本文件在 storage/ 包内，往上退一级才是程序目录
+    return Path(__file__).resolve().parent.parent
 
 
 def _clean_repeat(repeat: str) -> str:
