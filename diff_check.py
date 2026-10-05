@@ -186,7 +186,10 @@ def _compare(other_dir: str) -> int:
         print(f"找不到 {other_script}")
         return 2
 
-    env = dict(os.environ, PYTHONIOENCODING="utf-8")
+    # 别让子进程在另一份副本里写 __pycache__，保持那份工作区干净
+    env = dict(
+        os.environ, PYTHONIOENCODING="utf-8", PYTHONDONTWRITEBYTECODE="1"
+    )
     result = subprocess.run(
         [sys.executable, str(other_script), "--dump"],
         capture_output=True, text=True, encoding="utf-8", env=env,
@@ -198,13 +201,16 @@ def _compare(other_dir: str) -> int:
         return 2
 
     mine = build_digest()
-    theirs = result.stdout
-    if mine == theirs:
-        print(f"行为一致：本目录与 {other_script.parent} 的摘要逐字相同")
+    # 子进程经管道输出时行尾会变成 \r\n、末尾还多个换行，统一成行列表再比
+    theirs = result.stdout.replace("\r\n", "\n").replace("\r", "\n")
+    mine_lines = mine.splitlines()
+    their_lines = theirs.splitlines()
+    if mine_lines == their_lines:
+        print(f"行为一致：本目录与 {other_script.parent} 的摘要逐行相同")
         return 0
 
     diff = difflib.unified_diff(
-        theirs.splitlines(), mine.splitlines(),
+        their_lines, mine_lines,
         fromfile=str(other_script.parent), tofile="本目录", lineterm="",
     )
     lines = list(diff)
