@@ -7,11 +7,12 @@
 国内大部分网络连不上 GitHub，所以查询和下载都先直连、连不上再自动换镜像（见 MIRROR_PREFIXES）。
 镜像只是把原始 GitHub 地址接在前缀后面，附件内容仍按大小与 MZ 头核对，避免下到残缺或非程序的东西。
 
-更稳的办法是自建主源：把 exe 和一份 latest.json 放进对象存储（阿里云 OSS、腾讯云 COS 均可），
-国内直连稳定、完全可控。填好 PRIMARY_SOURCE 后先问主源，主源不可用再退回 GitHub 与镜像。
-latest.json 形如：
+更稳的办法是自建主源：把 exe 和一份 latest.json 放进稳定的托管处（现在默认用 Gitee 发布仓库，
+也可换成阿里云 OSS、腾讯云 COS 等），国内直连稳定、完全可控。填好 PRIMARY_SOURCE 后先问主源，
+主源不可用再退回 GitHub 与镜像。latest.json 形如：
     {"version": "0.2.2", "notes": "更新说明", "asset_name": "日程计划表.exe",
-     "asset_size": 38343151, "asset_url": "https://bucket.oss-cn-hangzhou.aliyuncs.com/schedule/日程计划表.exe"}
+     "asset_size": 38343151,
+     "asset_url": "https://gitee.com/zhan-bohao/schedule-release/releases/download/v0.2.2/日程计划表.exe"}
 其中 asset_url、asset_name、asset_size、notes 都可省略，asset_url 缺省时按 {主源}/v{版本}/{文件名} 拼。
 
 只换 exe 本身，程序目录里的 schedule.db 与「铃声」文件夹一概不碰。
@@ -68,10 +69,12 @@ CHECK_INTERVAL = 24 * 60 * 60
 CHUNK = 64 * 1024
 TIMEOUT = 30.0
 
-# 主更新源：自建对象存储的目录地址（阿里云 OSS / 腾讯云 COS 等），末尾不要带斜杠。
-# 目录里放一份 latest.json（格式见文件头说明）和对应的 exe。
-# 留空表示不启用主源，行为跟以前一样只走 GitHub 与镜像；也可用环境变量临时覆盖。
-PRIMARY_SOURCE = os.environ.get("SCHEDULE_UPDATE_SOURCE", "").strip().rstrip("/")
+# 主更新源：放 latest.json 的目录地址，末尾不要带斜杠。
+# 默认用 Gitee 发布仓库的 raw 目录——国内直连稳定，latest.json 与 exe 都在这个仓库里。
+# 想换自己的对象存储（阿里云 OSS / 腾讯云 COS 等）时，改这里或用环境变量覆盖即可。
+PRIMARY_SOURCE = os.environ.get(
+    "SCHEDULE_UPDATE_SOURCE", "https://gitee.com/zhan-bohao/schedule-release/raw/master"
+).strip().rstrip("/")
 # 主源里描述最新版本的元数据文件名
 PRIMARY_META = "latest.json"
 

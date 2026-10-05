@@ -36,10 +36,14 @@ class FetchReleaseFallbackTest(unittest.TestCase):
 
     def setUp(self):
         self.real = u._read_json
+        self.real_source = u.PRIMARY_SOURCE
+        # 这组测试只盯 GitHub 直连与镜像这条线，主源单独在 test_updater_primary 里测
+        u.PRIMARY_SOURCE = ""
         self.calls = []
 
     def tearDown(self):
         u._read_json = self.real
+        u.PRIMARY_SOURCE = self.real_source
 
     def _stub(self, direct_error, mirror_data):
         def fake(url, timeout):
