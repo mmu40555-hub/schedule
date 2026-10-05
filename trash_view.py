@@ -220,8 +220,17 @@ class TrashView(QWidget):
         return [memo for memo in ordered if memo.id in self._selected]
 
     def _refresh_bar(self) -> None:
+        # 清布局不能只 takeAt：控件还挂在 bar 上照样显示，旧的空提示会一直赖着。
+        # 子页留着复用（下面再挂回去），空提示这类临时控件直接销毁。
+        reusable = {id(widget) for widget in self._items.values()}
         while self.bar_box.count():
-            self.bar_box.takeAt(0)
+            entry = self.bar_box.takeAt(0)
+            widget = entry.widget()
+            if widget is None:
+                continue
+            widget.setParent(None)
+            if id(widget) not in reusable:
+                widget.deleteLater()
         ordered = self._bar_order()
         if not ordered:
             label = QLabel("没有匹配的便签" if self._memos else "废弃栏还是空的")
