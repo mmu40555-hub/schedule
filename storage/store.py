@@ -1,14 +1,5 @@
-"""SQLite 存储层：任务定义、每日完成记录、今日视图生成。
-
-三类任务定义分别存放在 daily_tasks / once_tasks / period_tasks，
-首页的「今日一览」不落库，而是每次根据定义 + 当天日期实时推导。
-"""
-
-import calendar
 import sqlite3
-import sys
-from dataclasses import dataclass
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from models import (
@@ -25,381 +16,54 @@ from models import (
     TodayItem,
 )
 
-
-def _app_dir() -> Path:
-    """打包成 exe 后 __file__ 指向临时解包目录，数据文件要落在 exe 旁边。"""
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent
-
-
-DB_PATH = _app_dir() / "schedule.db"
-
-# 历史未完成记录最多回溯多少天（避免积压栏被陈年数据淹没）
-BACKLOG_LOOKBACK_DAYS = 7
-
-# 陈年旧账的回溯天数：每周/每月任务的漏勾日子间隔更远，得多看一阵子
-BACKLOG_LOOKBACK = {
-    REPEAT_DAILY: BACKLOG_LOOKBACK_DAYS,
-    REPEAT_WEEKLY: 14,
-    REPEAT_MONTHLY: 62,
-}
-
-# 没勾「每天显示」的临时任务，只在到期前这几天开始出现在首页
-ONCE_LEAD_DAYS = 3
-
-# 有时限的任务默认提前多久提醒（分钟），可逐条改
-DEFAULT_REMIND_MINUTES = 10
-
-# 忽略记录的类型：不再保留的积压项 / 不再提醒的横幅
-KIND_BACKLOG = "backlog"
-KIND_BANNER = "banner"
-
-# 悬浮窗透明度（0.30 ~ 1.0）持久化用的设置键
-SETTING_FLOAT_OPACITY = "float_opacity"
-DEFAULT_FLOAT_OPACITY = 0.9
-# 再低就找不着那个调整按钮了，所以卡在 30%
-MIN_FLOAT_OPACITY = 0.30
-
-# 设置项：新任务默认提前多久提醒 / 到点提醒的弹出方式
-SETTING_DEFAULT_REMIND = "default_remind_minutes"
-SETTING_REMIND_MODE = "remind_mode"
-
-# 到点提醒要不要响一声系统提示音
-SETTING_REMIND_SOUND = "remind_sound"
-
-# 用哪个音频提醒："alias:系统音别名" 或 "file:本地音频路径"
-SETTING_REMIND_SOUND_CHOICE = "remind_sound_choice"
-# 用户添加过的本地音频文件，换行分隔
-SETTING_REMIND_SOUND_FILES = "remind_sound_files"
-
-# 主导航放顶部还是左侧
-SETTING_NAV_POSITION = "nav_position"
-NAV_TOP = "top"
-NAV_LEFT = "left"
-NAV_POSITIONS = [
-    (NAV_TOP, "顶部横向导航"),
-    (NAV_LEFT, "左侧竖向导航"),
-]
-
-# 一摞便签最多叠几张
-MAX_MEMO_STACK = 5
-
-# 全局快捷键：在任何程序里按下就能在鼠标处新建一张桌面便签
-SETTING_NEW_NOTE_HOTKEY = "new_note_hotkey"
-DEFAULT_NEW_NOTE_HOTKEY = "Ctrl+Alt+N"
-
-# 自动更新：开不开自动检查、上次检查的时间戳、用户说过要跳过的版本
-SETTING_AUTO_UPDATE = "auto_update_check"
-SETTING_UPDATE_LAST = "update_last_check"
-SETTING_UPDATE_SKIP = "update_skip_version"
-
-REMIND_AUTO = "auto"     # 有悬浮窗就在悬浮窗内提示，否则弹置底小窗
-REMIND_POPUP = "popup"   # 只用置底小窗
-REMIND_BOTH = "both"     # 两处都提示
-
-REMIND_MODES = [
-    (REMIND_AUTO, "自动：有悬浮窗就在窗内提示，否则弹置底小窗"),
-    (REMIND_POPUP, "只用置底小窗"),
-    (REMIND_BOTH, "两处都提示：悬浮窗 + 置底小窗"),
-]
-
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS daily_tasks (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    title         TEXT    NOT NULL,
-    group_name    TEXT    NOT NULL DEFAULT '',
-    has_deadline  INTEGER NOT NULL DEFAULT 0,
-    deadline_time TEXT    NOT NULL DEFAULT '',
-    remind_minutes INTEGER NOT NULL DEFAULT 10,
-    note          TEXT    NOT NULL DEFAULT '',
-    backlog       INTEGER NOT NULL DEFAULT 1,
-    repeat        TEXT    NOT NULL DEFAULT 'daily',
-    repeat_day    INTEGER NOT NULL DEFAULT 0,
-    created_day   TEXT    NOT NULL DEFAULT '',
-    sort_order    INTEGER NOT NULL DEFAULT 0
-);
-
-CREATE TABLE IF NOT EXISTS daily_records (
-    daily_task_id INTEGER NOT NULL,
-    day           TEXT    NOT NULL,
-    done          INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (daily_task_id, day)
-);
-
-CREATE TABLE IF NOT EXISTS once_tasks (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    title      TEXT    NOT NULL,
-    group_name TEXT    NOT NULL DEFAULT '',
-    day        TEXT    NOT NULL,
-    time       TEXT    NOT NULL DEFAULT '',
-    remind_minutes INTEGER NOT NULL DEFAULT 10,
-    note       TEXT    NOT NULL DEFAULT '',
-    status     TEXT    NOT NULL DEFAULT 'pending',
-    always_show INTEGER NOT NULL DEFAULT 0,
-    sort_order INTEGER NOT NULL DEFAULT 0,
-    done_at    TEXT    NOT NULL DEFAULT ''
-);
-
-CREATE TABLE IF NOT EXISTS period_tasks (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    title      TEXT    NOT NULL,
-    group_name TEXT    NOT NULL DEFAULT '',
-    deadline   TEXT    NOT NULL,
-    note       TEXT    NOT NULL DEFAULT '',
-    archived   INTEGER NOT NULL DEFAULT 0,
-    sort_order INTEGER NOT NULL DEFAULT 0,
-    done_at    TEXT    NOT NULL DEFAULT ''
-);
-
-CREATE TABLE IF NOT EXISTS period_stages (
-    id             INTEGER PRIMARY KEY AUTOINCREMENT,
-    period_task_id INTEGER NOT NULL,
-    title          TEXT    NOT NULL,
-    deadline       TEXT    NOT NULL,
-    done           INTEGER NOT NULL DEFAULT 0,
-    sort_order     INTEGER NOT NULL DEFAULT 0
-);
-
-CREATE TABLE IF NOT EXISTS dismissals (
-    item_key TEXT NOT NULL,
-    kind     TEXT NOT NULL,
-    PRIMARY KEY (item_key, kind)
-);
-
-CREATE TABLE IF NOT EXISTS today_order (
-    day      TEXT    NOT NULL,
-    column_id TEXT   NOT NULL,
-    item_key TEXT    NOT NULL,
-    position INTEGER NOT NULL,
-    PRIMARY KEY (day, column_id, item_key)
-);
-
-CREATE TABLE IF NOT EXISTS task_groups (
-    name       TEXT PRIMARY KEY,
-    sort_order INTEGER NOT NULL DEFAULT 0
-);
-
-CREATE TABLE IF NOT EXISTS app_settings (
-    key   TEXT PRIMARY KEY,
-    value TEXT NOT NULL DEFAULT ''
-);
-
-CREATE TABLE IF NOT EXISTS reminder_log (
-    item_key TEXT NOT NULL,
-    day      TEXT NOT NULL,
-    PRIMARY KEY (item_key, day)
-);
-
-CREATE TABLE IF NOT EXISTS memos (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    content     TEXT    NOT NULL DEFAULT '',
-    x           INTEGER NOT NULL DEFAULT 0,
-    y           INTEGER NOT NULL DEFAULT 0,
-    stack_id    INTEGER NOT NULL DEFAULT 0,
-    stack_order INTEGER NOT NULL DEFAULT 0,
-    stack_active INTEGER NOT NULL DEFAULT 1,
-    pinned      INTEGER NOT NULL DEFAULT 0,
-    host_class  TEXT    NOT NULL DEFAULT '',
-    host_title  TEXT    NOT NULL DEFAULT '',
-    host_dx     INTEGER NOT NULL DEFAULT 0,
-    host_dy     INTEGER NOT NULL DEFAULT 0,
-    updated_day TEXT    NOT NULL DEFAULT '',
-    discarded_at TEXT   NOT NULL DEFAULT ''
-);
-"""
-
-
-# ---------------- 实体 ----------------
-
-@dataclass
-class DailyTask:
-    id: int
-    title: str
-    group_name: str = ""
-    has_deadline: bool = False
-    deadline_time: str = ""
-    note: str = ""
-    backlog: bool = True          # 未完成时是否进「陈年旧账」
-    created_day: str = ""
-    sort_order: int = 0
-    remind_minutes: int = DEFAULT_REMIND_MINUTES   # 截止前几分钟提醒
-    repeat: str = REPEAT_DAILY    # 重复周期：每天 / 每周 / 每月
-    repeat_day: int = 0           # 每周→星期几(0~6)，每月→几号(1~31)，每天忽略
-
-
-@dataclass
-class OnceTask:
-    id: int
-    title: str
-    day: str
-    time: str = ""
-    note: str = ""
-    status: str = "pending"
-    always_show: bool = False     # 每天都显示；否则只在到期前三天出现
-    sort_order: int = 0
-    group_name: str = ""
-    remind_minutes: int = DEFAULT_REMIND_MINUTES   # 到点前几分钟提醒
-    done_at: str = ""             # 完成时刻，形如 2026-07-07 15:04:05；没完成是空串
-
-
-@dataclass
-class PeriodTask:
-    id: int
-    title: str
-    deadline: str
-    note: str = ""
-    archived: bool = False
-    sort_order: int = 0
-    group_name: str = ""
-    done_at: str = ""             # 所有阶段做完才算完成，记下那一刻
-
-
-@dataclass
-class PeriodStage:
-    id: int
-    period_task_id: int
-    title: str
-    deadline: str
-    done: bool = False
-    sort_order: int = 0
-
-
-@dataclass
-class Reminder:
-    """一条待提醒的时限任务。"""
-
-    key: str              # 与今日一览一致的 item_key，用于去重与联动
-    title: str
-    due_at: datetime      # 到点时刻
-    source: str
-    remind_minutes: int   # 提前量，用于文案「N 分钟后」
-    group_name: str = ""
-    note: str = ""
-
-    @property
-    def minutes_left(self) -> int:
-        delta = (self.due_at - datetime.now()).total_seconds()
-        return max(0, int(delta // 60))
-
-
-@dataclass
-class HistoryEntry:
-    """历史汇总里的一条：一个完成过的任务。
-
-    长期每日任务不进历史，所以这里只有临时任务与时期任务。
-    """
-
-    key: str            # 与今日一览一致的 item_key
-    title: str
-    source: str
-    group: str = ""
-    note: str = ""
-    done_at: str = ""   # 完成时刻；老数据没这个字段，为空
-    plan: str = ""      # 任务的计划日期 / 最终期限，完成时刻缺失时拿它排序
-
-    @property
-    def sort_key(self) -> str:
-        """排序用的时间：优先真实的完成时刻，老数据退回计划日期。"""
-        return self.done_at or self.plan
-
-
-@dataclass
-class Memo:
-    """一张便签：位置自由，内容即文本，同摞的共享一个 stack_id。"""
-
-    id: int
-    content: str = ""
-    x: int = 0
-    y: int = 0
-    stack_id: int = 0       # 0 表示单独一张；同号的叠成一摞
-    stack_order: int = 0    # 摞内编号，页签序号就按它排，进摞后不再变动
-    stack_active: int = 1   # 1 表示这一摞当前露在外面的就是这张
-    pinned: int = 0         # 1 表示钉在桌面上（独立小窗），0 表示躺在备忘录页面里
-    # 钉在某个程序窗口上时，记下那个窗口是谁：类名 + 标题用于下次开程序时把它找回来，
-    # dx / dy 是便签左上角相对该窗口左上角的距离，窗口一动就照这个把它带过去
-    host_class: str = ""
-    host_title: str = ""
-    host_dx: int = 0
-    host_dy: int = 0
-    updated_day: str = ""
-    discarded_at: str = ""   # 丢弃时刻；非空表示躺在「废弃栏」里，不再出现在备忘录页面
-
-
-def _memo(row: sqlite3.Row) -> Memo:
-    return Memo(
-        id=row["id"],
-        content=row["content"],
-        x=row["x"],
-        y=row["y"],
-        stack_id=row["stack_id"],
-        stack_order=row["stack_order"],
-        stack_active=row["stack_active"],
-        pinned=row["pinned"],
-        host_class=row["host_class"],
-        host_title=row["host_title"],
-        host_dx=row["host_dx"],
-        host_dy=row["host_dy"],
-        updated_day=row["updated_day"],
-        discarded_at=row["discarded_at"],
-    )
-
-
-def _daily(row: sqlite3.Row) -> DailyTask:
-    return DailyTask(
-        id=row["id"],
-        title=row["title"],
-        group_name=row["group_name"],
-        has_deadline=bool(row["has_deadline"]),
-        deadline_time=row["deadline_time"],
-        note=row["note"],
-        backlog=bool(row["backlog"]),
-        created_day=row["created_day"],
-        sort_order=row["sort_order"],
-        remind_minutes=row["remind_minutes"],
-        repeat=row["repeat"],
-        repeat_day=row["repeat_day"],
-    )
-
-
-def _once(row: sqlite3.Row) -> OnceTask:
-    return OnceTask(
-        id=row["id"],
-        title=row["title"],
-        day=row["day"],
-        time=row["time"],
-        note=row["note"],
-        status=row["status"],
-        always_show=bool(row["always_show"]),
-        sort_order=row["sort_order"],
-        group_name=row["group_name"],
-        remind_minutes=row["remind_minutes"],
-        done_at=row["done_at"],
-    )
-
-
-def _period(row: sqlite3.Row) -> PeriodTask:
-    return PeriodTask(
-        id=row["id"],
-        title=row["title"],
-        deadline=row["deadline"],
-        note=row["note"],
-        archived=bool(row["archived"]),
-        sort_order=row["sort_order"],
-        group_name=row["group_name"],
-        done_at=row["done_at"],
-    )
-
-
-def _stage(row: sqlite3.Row) -> PeriodStage:
-    return PeriodStage(
-        id=row["id"],
-        period_task_id=row["period_task_id"],
-        title=row["title"],
-        deadline=row["deadline"],
-        done=bool(row["done"]),
-        sort_order=row["sort_order"],
-    )
+from .helpers import (
+    _clean_repeat,
+    _in_window,
+    _moment,
+    _month_day,
+    _pretty_day,
+    _stamp,
+)
+from .records import (
+    DailyTask,
+    HistoryEntry,
+    Memo,
+    OnceTask,
+    PeriodStage,
+    PeriodTask,
+    Reminder,
+    _daily,
+    _memo,
+    _once,
+    _period,
+    _stage,
+)
+from .schema import (
+    BACKLOG_LOOKBACK,
+    BACKLOG_LOOKBACK_DAYS,
+    DB_PATH,
+    DEFAULT_NEW_NOTE_HOTKEY,
+    DEFAULT_REMIND_MINUTES,
+    KIND_BACKLOG,
+    KIND_BANNER,
+    MAX_MEMO_STACK,
+    NAV_POSITIONS,
+    NAV_TOP,
+    ONCE_LEAD_DAYS,
+    REMIND_AUTO,
+    REMIND_MODES,
+    SCHEMA,
+    SETTING_AUTO_UPDATE,
+    SETTING_DEFAULT_REMIND,
+    SETTING_NAV_POSITION,
+    SETTING_NEW_NOTE_HOTKEY,
+    SETTING_REMIND_MODE,
+    SETTING_REMIND_SOUND,
+    SETTING_REMIND_SOUND_CHOICE,
+    SETTING_REMIND_SOUND_FILES,
+    SETTING_UPDATE_LAST,
+    SETTING_UPDATE_SKIP,
+)
 
 
 class Store:
@@ -1649,43 +1313,3 @@ class Store:
             (task_id, day.isoformat(), int(done)),
         )
         self.conn.commit()
-
-
-def _clean_repeat(repeat: str) -> str:
-    """校验重复周期，非法的落回「每天」。"""
-    if repeat in (REPEAT_DAILY, REPEAT_WEEKLY, REPEAT_MONTHLY):
-        return repeat
-    return REPEAT_DAILY
-
-
-def _stamp() -> str:
-    """当前时刻，形如 2026-07-07 15:04:05；完成时间与丢弃时间都用它。"""
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
-def _month_day(day: date, repeat_day: int) -> int:
-    """每月任务的「几号」：超过当月天数就落到当月最后一天（如 2 月记 31 号时算 28/29 号）。"""
-    last = calendar.monthrange(day.year, day.month)[1]
-    return min(max(1, int(repeat_day)), last)
-
-
-def _pretty_day(day_str: str) -> str:
-    """把 2026-07-08 变成 7/8。"""
-    try:
-        parsed = date.fromisoformat(day_str)
-    except ValueError:
-        return day_str
-    return f"{parsed.month}/{parsed.day}"
-
-
-def _moment(day_str: str, hhmm: str) -> datetime:
-    """把 2026-09-22 与 15:00 合成一个 datetime。"""
-    hour, minute = (int(part) for part in hhmm.split(":")[:2])
-    return datetime.combine(date.fromisoformat(day_str), time(hour, minute))
-
-
-def _in_window(now: datetime, due_at: datetime, lead_minutes: int) -> bool:
-    """是否已进入「到点前 lead_minutes 分钟」的提醒窗口；0 表示不提醒。"""
-    if lead_minutes <= 0:
-        return False
-    return due_at - timedelta(minutes=lead_minutes) <= now <= due_at
